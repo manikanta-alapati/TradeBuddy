@@ -189,19 +189,19 @@ Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
             portfolio_vector = embed_text(portfolio_summary)
             
             await upsert_embedding(
-                db,
-                user_id=user_id,
-                kind="portfolio_summary",
-                doc_id=f"portfolio-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-                vector=portfolio_vector,
-                chunk=portfolio_summary,
-                metadata={
-                    "totalValue": total_value,
-                    "totalPnL": total_pnl,
-                    "holdingsCount": len(holdings),
-                    "generatedAt": datetime.now(timezone.utc)
-                }
-            )
+    db,
+    user_id=user_id,
+    kind="portfolio_summary",
+    doc_id=f"portfolio-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+    vector=portfolio_vector,
+    chunk=portfolio_summary,
+    metadata={
+        "totalValue": total_value,
+        "totalPnL": total_pnl,
+        "holdingsCount": len(holdings),
+        "generatedAt": datetime.now(timezone.utc).isoformat()  # ← Changed to .isoformat()
+    }
+)
             
             embeddings_created += 1
         
@@ -233,16 +233,16 @@ Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
             funds_vector = embed_text(funds_summary)
             
             await upsert_embedding(
-                db,
-                user_id=user_id,
-                kind="funds_summary",
-                doc_id=f"funds-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-                vector=funds_vector,
-                chunk=funds_summary,
-                metadata={
-                    "generatedAt": datetime.now(timezone.utc)
-                }
-            )
+    db,
+    user_id=user_id,
+    kind="funds_summary",
+    doc_id=f"funds-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+    vector=funds_vector,
+    chunk=funds_summary,
+    metadata={
+        "generatedAt": datetime.now(timezone.utc).isoformat()  # ← Changed to .isoformat()
+    }
+)
             
             embeddings_created += 1
         
@@ -309,18 +309,18 @@ Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
                 symbol_vector = embed_text(symbol_summary)
                 
                 await upsert_embedding(
-                    db,
-                    user_id=user_id,
-                    kind="symbol_summary",
-                    doc_id=f"{symbol}-recent",
-                    vector=symbol_vector,
-                    chunk=symbol_summary,
-                    metadata={
-                        "symbol": symbol,
-                        "tradesCount": len(trades_list),
-                        "generatedAt": datetime.now(timezone.utc)
-                    }
-                )
+    db,
+    user_id=user_id,
+    kind="symbol_summary",
+    doc_id=f"{symbol}-recent",
+    vector=symbol_vector,
+    chunk=symbol_summary,
+    metadata={
+        "symbol": symbol,
+        "tradesCount": len(trades_list),
+        "generatedAt": datetime.now(timezone.utc).isoformat()  # ← Changed to .isoformat()
+    }
+)
                 
                 embeddings_created += 1
         
@@ -362,18 +362,18 @@ Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
                 positions_vector = embed_text(positions_summary)
                 
                 await upsert_embedding(
-                    db,
-                    user_id=user_id,
-                    kind="positions_summary",
-                    doc_id=f"positions-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-                    vector=positions_vector,
-                    chunk=positions_summary,
-                    metadata={
-                        "dayPnL": total_day_pnl,
-                        "positionsCount": len(positions_parts),
-                        "generatedAt": datetime.now(timezone.utc)
-                    }
-                )
+    db,
+    user_id=user_id,
+    kind="positions_summary",
+    doc_id=f"positions-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+    vector=positions_vector,
+    chunk=positions_summary,
+    metadata={
+        "dayPnL": total_day_pnl,
+        "positionsCount": len(positions_parts),
+        "generatedAt": datetime.now(timezone.utc).isoformat()  # ← Changed to .isoformat()
+    }
+)
                 
                 embeddings_created += 1
         
