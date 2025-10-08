@@ -112,12 +112,297 @@ async def run_incremental_sync(
 
 async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId) -> Dict[str, Any]:
     """
-    Minimal placeholder. You can implement:
-      - compute_symbol_month_rollups(...)
-      - summarize_symbol_month(...)
-      - embed_text(...)
-      - upsert_embedding(...)
-    For now we return a no-op result so your scheduler/job path is stable.
+    Complete embeddings generation pipeline:
+    1. Generate portfolio summary
+    2. Generate symbol-month summaries
+    3. Convert to embeddings
+    4. Store in MongoDB
+    
+    This makes your portfolio data searchable with semantic queries.
     """
-    # TODO: implement your real summarization + embedding pipeline here.
-    return {"userId": str(user_id), "built": 0, "status": "noop"}
+    from app.services.llm import embed_text
+    from app.services.vector import upsert_embedding
+    from app.services.rollup import compute_symbol_month_rollups
+    from app.services.summarize import summarize_symbol_month
+    from datetime import datetime, timezone
+    
+    embeddings_created = 0
+    errors = []
+    
+    # Get user phone for embedding metadata
+    user = await db["users"].find_one({"_id": user_id})
+    phone = user.get("phone") if user else None
+    
+    try:
+        # ============================================
+        # 1. PORTFOLIO SUMMARY EMBEDDING
+        # ============================================
+        
+        # Fetch current holdings
+        holdings = await db["holdings"].find({"userId": user_id}).to_list(None)
+        
+        if holdings:
+            # Calculate portfolio metrics
+            total_value = 0
+            total_investment = 0
+            holdings_text_parts = []
+            
+            for h in holdings:
+                qty = h.get("qty", 0)
+                avg_price = h.get("avgPrice", 0)
+                last_price = h.get("lastPrice", 0)
+                symbol = h.get("tradingsymbol", "UNKNOWN")
+                
+                investment = qty * avg_price
+                current_value = qty * last_price
+                pnl = current_value - investment
+                pnl_pct = (pnl / investment * 100) if investment > 0 else 0
+                
+                total_investment += investment
+                total_value += current_value
+                
+                # Create human-readable text for this holding
+                holdings_text_parts.append(
+                    f"{symbol}: {qty} shares at avg Rs{avg_price:.2f}, "
+                    f"current Rs{last_price:.2f}, "
+                    f"P&L: Rs{pnl:,.2f} ({pnl_pct:+.2f}%)"
+                )
+            
+            # Overall portfolio summary
+            total_pnl = total_value - total_investment
+            total_pnl_pct = (total_pnl / total_investment * 100) if total_investment > 0 else 0
+            holdings_breakdown = "\n".join(holdings_text_parts)
+
+            portfolio_summary = f"""Portfolio Overview:
+Total Holdings: {len(holdings)} stocks
+Total Investment: Rs.{total_investment:,.2f}
+Current Value: Rs.{total_value:,.2f}
+Total P&L: Rs.{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)
+
+Holdings Breakdown:
+{holdings_breakdown}
+
+Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+"""
+            
+            # Generate embedding and store
+            portfolio_vector = embed_text(portfolio_summary)
+            
+            await upsert_embedding(
+                db,
+                user_id=user_id,
+                kind="portfolio_summary",
+                doc_id=f"portfolio-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                vector=portfolio_vector,
+                chunk=portfolio_summary,
+                metadata={
+                    "totalValue": total_value,
+                    "totalPnL": total_pnl,
+                    "holdingsCount": len(holdings),
+                    "generatedAt": datetime.now(timezone.utc)
+                }
+            )
+            
+            embeddings_created += 1
+        
+        # ============================================
+        # 2. FUNDS SUMMARY EMBEDDING
+        # ============================================
+        
+        funds = await db["funds"].find({"userId": user_id}).to_list(None)
+        
+        if funds:
+            funds_parts = []
+            for f in funds:
+                segment = f.get("segment", "EQUITY")
+                available = f.get("available", 0)
+                net = f.get("net", 0)
+                
+                funds_parts.append(
+                    f"{segment}: Available Rs{available:,.2f}, Net Rs{net:,.2f}"
+                )
+            
+            funds_breakdown = "\n".join(funds_parts)
+
+            funds_summary = f"""Account Funds:
+{funds_breakdown}
+
+Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+"""
+            
+            funds_vector = embed_text(funds_summary)
+            
+            await upsert_embedding(
+                db,
+                user_id=user_id,
+                kind="funds_summary",
+                doc_id=f"funds-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                vector=funds_vector,
+                chunk=funds_summary,
+                metadata={
+                    "generatedAt": datetime.now(timezone.utc)
+                }
+            )
+            
+            embeddings_created += 1
+        
+        # ============================================
+        # 3. SYMBOL-MONTH SUMMARIES (Per Stock Performance)
+        # ============================================
+        
+        # Get last 3 months of trade data
+        from datetime import timedelta
+        three_months_ago = datetime.now(timezone.utc) - timedelta(days=90)
+        
+        # Get unique symbols that were traded
+        trades = await db["trades"].find({
+            "userId": user_id,
+            "ts": {"$gte": three_months_ago}
+        }).to_list(None)
+        
+        if trades:
+            # Group trades by symbol
+            symbol_trades = {}
+            for trade in trades:
+                symbol = trade.get("symbol", "UNKNOWN")
+                if symbol not in symbol_trades:
+                    symbol_trades[symbol] = []
+                symbol_trades[symbol].append(trade)
+            
+            # Create summary for each symbol
+            for symbol, trades_list in symbol_trades.items():
+                # Calculate metrics
+                buy_amount = 0
+                sell_amount = 0
+                total_qty = 0
+                
+                for t in trades_list:
+                    qty = t.get("qty", 0)
+                    price = t.get("price", 0)
+                    amount = qty * price
+                    
+                    # Determine if buy or sell (you may need to add 'side' field to trades)
+                    # For now, we'll just aggregate all trades
+                    total_qty += qty
+                    buy_amount += amount
+                
+                # Get current holding for this symbol
+                holding = await db["holdings"].find_one({
+                    "userId": user_id,
+                    "tradingsymbol": symbol
+                })
+                
+                current_price = holding.get("lastPrice", 0) if holding else 0
+                current_qty = holding.get("qty", 0) if holding else 0
+                
+                symbol_summary = f"""{symbol} Trading Activity (Last 3 Months):
+Total Trades: {len(trades_list)}
+Total Quantity Traded: {total_qty}
+Current Holding: {current_qty} shares at Rs.{current_price:.2f}
+Trade Volume: Rs.{buy_amount:,.2f}
+
+Recent Activity: {len(trades_list)} trades executed in the last 90 days.
+
+Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+"""
+                
+                symbol_vector = embed_text(symbol_summary)
+                
+                await upsert_embedding(
+                    db,
+                    user_id=user_id,
+                    kind="symbol_summary",
+                    doc_id=f"{symbol}-recent",
+                    vector=symbol_vector,
+                    chunk=symbol_summary,
+                    metadata={
+                        "symbol": symbol,
+                        "tradesCount": len(trades_list),
+                        "generatedAt": datetime.now(timezone.utc)
+                    }
+                )
+                
+                embeddings_created += 1
+        
+        # ============================================
+        # 4. POSITIONS SUMMARY (Current Day Trading)
+        # ============================================
+        
+        positions = await db["positions"].find({"userId": user_id}).to_list(None)
+        
+        if positions:
+            positions_parts = []
+            total_day_pnl = 0
+            
+            for p in positions:
+                symbol = p.get("tradingsymbol", "UNKNOWN")
+                bucket = p.get("bucket", "net")
+                qty = p.get("qty", 0)
+                pnl = p.get("pnl", 0)
+                
+                if bucket == "day":
+                    total_day_pnl += pnl
+                    positions_parts.append(
+                        f"{symbol}: {qty} qty, Day P&L: Rs{pnl:,.2f}"
+                    )
+            
+            if positions_parts:
+                positions_breakdown = "\n".join(positions_parts)
+
+                positions_summary = f"""Current Day Positions:
+Total Day P&L: Rs.{total_day_pnl:,.2f}
+
+Active Positions:
+{positions_breakdown}
+
+Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+"""
+
+                
+                positions_vector = embed_text(positions_summary)
+                
+                await upsert_embedding(
+                    db,
+                    user_id=user_id,
+                    kind="positions_summary",
+                    doc_id=f"positions-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                    vector=positions_vector,
+                    chunk=positions_summary,
+                    metadata={
+                        "dayPnL": total_day_pnl,
+                        "positionsCount": len(positions_parts),
+                        "generatedAt": datetime.now(timezone.utc)
+                    }
+                )
+                
+                embeddings_created += 1
+        
+    except Exception as e:
+        errors.append(str(e))
+        print(f"[Embeddings] Error for user {user_id}: {e}")
+    
+    return {
+        "userId": str(user_id),
+        "embeddingsCreated": embeddings_created,
+        "errors": errors,
+        "status": "success" if embeddings_created > 0 else "no_data"
+    }
+
+
+
+
+async def list_active_users(db: AsyncIOMotorDatabase) -> List[ObjectId]:
+    """
+    Get list of all users with active Zerodha connections.
+    Used by scheduler to sync all users periodically.
+    """
+    cursor = db["connections"].find(
+        {"provider": "zerodha", "enabled": True},
+        {"userId": 1}
+    )
+    
+    user_ids = []
+    async for doc in cursor:
+        user_ids.append(doc["userId"])
+    
+    return user_ids

@@ -434,59 +434,6 @@ async def debug_trades(userId: str, request: Request):
     return {"count": len(trades), "sample": trades[:3]}
 
 
-@app.get("/callback", response_class=HTMLResponse)
-async def kite_callback(request: Request):
-    """
-    Zerodha redirects here after login:
-    /callback?...&request_token=XXXX&action=login
-    We also expect userId in the query: /callback?userId=<ObjectId>
-    """
-    q = request.query_params
-    request_token = q.get("request_token")
-    user_id_str = q.get("userId")
-
-    if not request_token:
-        raise HTTPException(status_code=400, detail="Missing request_token")
-    if not user_id_str:
-        raise HTTPException(status_code=400, detail="Missing userId in redirect URL")
-
-    try:
-        user_id = ObjectId(user_id_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid userId")
-
-    tokens = exchange_request_token_for_access_token(request_token)
-
-    db = request.app.state.mongodb
-    await db["connections"].update_one(
-        {"userId": user_id, "provider": "zerodha"},
-        {"$set": {
-            "userId": user_id,
-            "provider": "zerodha",
-            "apiKey": settings.kite_api_key,
-            "apiSecret": settings.kite_api_secret,
-            "accessToken": tokens["access_token"],
-            "publicToken": tokens.get("public_token"),
-            "scopes": ["read"],
-            "enabled": True,
-            "createdAt": dt.datetime.now(timezone.utc),
-        }},
-        upsert=True,
-    )
-
-    return HTMLResponse(
-        """
-        <html>
-          <body style="font-family:system-ui;padding:24px">
-            <h2>✅ Zerodha connected</h2>
-            <p>Your access token was saved. You can close this tab.</p>
-          </body>
-        </html>
-        """
-    )
-
-
-
 
 @app.post("/users/create")
 async def create_user(phone: str):
@@ -944,3 +891,22 @@ async def exchange_token_simple(userId: str, requestToken: str):
         "userId": userId,
         "message": "Zerodha connected successfully!"
     }
+    
+@app.post("/debug/generate-embeddings")
+    
+async def generate_embeddings_manually(userId: str):
+    """
+    Manually trigger embeddings generation for a user.
+    
+    This will:
+    1. Read portfolio data from MongoDB
+    2. Generate summaries
+    3. Create embeddings
+    4. Store in embeddings collection
+    """
+    from app.services.sync import build_embeddings_for_user
+    
+    user_id = ObjectId(userId)
+    result = await build_embeddings_for_user(app.state.mongodb, user_id)
+    
+    return result

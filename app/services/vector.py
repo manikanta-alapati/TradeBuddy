@@ -12,10 +12,12 @@ async def insert_embedding(
     kind: str,
     doc_id: str,
     vector: List[float],
-    chunk: str
+    chunk: str,
+    phone: str | None = None
 ) -> str:
     doc = {
         "userId": user_id,
+        "phone": phone,
         "kind": kind,
         "docId": doc_id,
         "vector": vector,
@@ -59,14 +61,17 @@ async def upsert_embedding(
     db: AsyncIOMotorDatabase,
     *,
     user_id: ObjectId,
+    
     kind: str,
     doc_id: str,
     vector: List[float],
     chunk: str,
     metadata: Optional[Dict[str, Any]] = None,
+    phone: str | None = None
 ) -> str:
     doc = {
         "userId": user_id,
+        "phone": phone,
         "kind": kind,
         "docId": doc_id,
         "vector": vector,
