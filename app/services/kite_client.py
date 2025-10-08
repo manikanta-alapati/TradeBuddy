@@ -18,6 +18,7 @@ class IKiteClient:
     def get_trades(self) -> List[Dict[str, Any]]: ...
     def get_instruments(self) -> List[Dict[str, Any]]: ...
 
+
 class RealKiteClient(IKiteClient):
     def __init__(self, api_key: str, access_token: str):
         if KiteConnect is None:
@@ -25,9 +26,13 @@ class RealKiteClient(IKiteClient):
         self.kite = KiteConnect(api_key=api_key)
         self.kite.set_access_token(access_token)
 
+    def profile(self):
+        """Get user profile (for token validation)."""
+        return self.kite.profile()
+
     def get_funds(self) -> Dict[str, Any]:
         return self.kite.margins()
-
+    
     def get_holdings(self) -> List[Dict[str, Any]]:
         return self.kite.holdings()
 
@@ -42,6 +47,8 @@ class RealKiteClient(IKiteClient):
 
     def get_instruments(self) -> List[Dict[str, Any]]:
         return self.kite.instruments()
+    
+    
 
 class StubKiteClient(IKiteClient):
     """Dev fallback so the app runs without a real token."""

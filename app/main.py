@@ -26,6 +26,13 @@ from app.services.kite_client import (
 )
 from app.services.mappers import map_holdings
 
+from app.services.user_management import (
+    get_or_create_user, 
+    get_user_by_phone, 
+    update_user_preference
+)
+
+
 # ---------------- helpers & models ----------------
 
 def pad(vec, dim=1536):  # keep index at 1536; pad short demo vectors
@@ -477,3 +484,463 @@ async def kite_callback(request: Request):
         </html>
         """
     )
+
+
+
+
+@app.post("/users/create")
+async def create_user(phone: str):
+    """Create or get user by phone number."""
+    user = await get_or_create_user(app.state.mongodb, phone)
+    
+    return {
+        "userId": str(user["_id"]),
+        "phone": user["phone"],
+        "preferences": user["preferences"],
+        "createdAt": user["createdAt"].isoformat()
+    }
+
+
+@app.get("/users/by-phone")
+async def get_user_by_phone_endpoint(phone: str):
+    """Get user details by phone number."""
+    user = await get_user_by_phone(app.state.mongodb, phone)
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "userId": str(user["_id"]),
+        "phone": user["phone"],
+        "preferences": user["preferences"],
+        "messageCount": user.get("conversationStats", {}).get("totalMessages", 0)
+    }
+
+
+@app.post("/users/preferences")
+async def update_preference(phone: str, key: str, value: str):
+    """Update user preference."""
+    success = await update_user_preference(
+        app.state.mongodb, 
+        phone, 
+        key, 
+        value
+    )
+    
+    return {"success": success, "preference": key, "value": value}
+# Add this to app/main.py
+
+@app.get("/zerodha/login-url")
+async def get_zerodha_login_url(phone: str):
+    """
+    Generate Zerodha login URL for a user.
+    
+    Usage:
+    GET /zerodha/login-url?phone=%2B919876543210
+    
+    Returns a URL to open in browser for Zerodha login.
+    After login, user will be redirected to /callback with access token.
+    """
+    from app.services.user_management import get_or_create_user
+    
+    # Get or create user
+    user = await get_or_create_user(app.state.mongodb, phone)
+    user_id = str(user["_id"])
+    
+    # Build Zerodha login URL
+    # Note: userId will be passed back via state parameter
+    login_url = (
+        f"https://kite.zerodha.com/connect/login?"
+        f"v=3&"
+        f"api_key={settings.kite_api_key}"
+    )
+    
+    # We need to modify callback to accept userId
+    # For now, return instructions
+    return {
+        "userId": user_id,
+        "phone": phone,
+        "loginUrl": login_url,
+        "instructions": [
+            "1. Click the loginUrl above",
+            "2. Login with your Zerodha credentials",
+            "3. After login, you'll be redirected to /callback",
+            f"4. Make sure the redirect URL includes: ?userId={user_id}",
+            "5. The callback will save your access token automatically"
+        ],
+        "fullLoginUrl": f"{login_url}&state={user_id}",
+        "note": "Open 'fullLoginUrl' in your browser. The state parameter carries your userId."
+    }
+
+
+# Update the existing /callback endpoint to handle state parameter
+
+@app.get("/callback", response_class=HTMLResponse)
+async def kite_callback(request: Request):
+    """
+    Zerodha redirects here after login:
+    /callback?status=success&request_token=XXXX&action=login&state=USER_ID
+    """
+    q = request.query_params
+    request_token = q.get("request_token")
+    status = q.get("status")
+    user_id_str = q.get("state") or q.get("userId")  # Try both
+    
+    # Check status
+    if status != "success":
+        return HTMLResponse(
+            """
+            <html>
+              <body style="font-family:system-ui;padding:24px">
+                <h2>❌ Login Failed</h2>
+                <p>Zerodha login was cancelled or failed.</p>
+                <p>Please try again.</p>
+              </body>
+            </html>
+            """
+        )
+    
+    if not request_token:
+        raise HTTPException(status_code=400, detail="Missing request_token")
+    
+    if not user_id_str:
+        raise HTTPException(
+            status_code=400, 
+            detail="Missing userId. Please use the login URL from /zerodha/login-url endpoint"
+        )
+    
+    try:
+        user_id = ObjectId(user_id_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid userId format")
+    
+    # Exchange request token for access token
+    try:
+        tokens = exchange_request_token_for_access_token(request_token)
+    except Exception as e:
+        return HTMLResponse(
+            f"""
+            <html>
+              <body style="font-family:system-ui;padding:24px">
+                <h2>❌ Token Exchange Failed</h2>
+                <p>Error: {str(e)}</p>
+                <p>Make sure your API key and secret are correct in .env file.</p>
+              </body>
+            </html>
+            """
+        )
+    
+    # Save to database
+    db = request.app.state.mongodb
+    await db["connections"].update_one(
+        {"userId": user_id, "provider": "zerodha"},
+        {"$set": {
+            "userId": user_id,
+            "provider": "zerodha",
+            "apiKey": settings.kite_api_key,
+            "apiSecret": settings.kite_api_secret,
+            "accessToken": tokens["access_token"],
+            "publicToken": tokens.get("public_token"),
+            "scopes": ["read"],
+            "enabled": True,
+            "createdAt": dt.datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+    
+    # Get user phone for display
+    user = await db["users"].find_one({"_id": user_id})
+    phone = user.get("phone", "Unknown") if user else "Unknown"
+    
+    return HTMLResponse(
+        f"""
+        <html>
+          <body style="font-family:system-ui;padding:24px;background:#f0f9ff">
+            <div style="max-width:600px;margin:0 auto;background:white;padding:32px;border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,0.1)">
+              <h2 style="color:#10b981;margin:0 0 16px 0">✅ Zerodha Connected!</h2>
+              
+              <div style="background:#ecfdf5;padding:16px;border-radius:8px;margin:16px 0">
+                <p style="margin:0;color:#059669"><strong>User:</strong> {phone}</p>
+                <p style="margin:8px 0 0 0;color:#059669;font-size:12px"><strong>User ID:</strong> {user_id_str}</p>
+              </div>
+              
+              <p style="color:#374151">Your Zerodha account is now connected to TradeBuddy!</p>
+              
+              <div style="margin-top:24px;padding:16px;background:#fef3c7;border-radius:8px">
+                <p style="margin:0;color:#92400e"><strong>⚠️ Important:</strong></p>
+                <p style="margin:8px 0 0 0;color:#92400e;font-size:14px">
+                  Zerodha access tokens expire daily. You'll need to re-login tomorrow.
+                </p>
+              </div>
+              
+              <div style="margin-top:24px">
+                <p style="color:#6b7280;font-size:14px">Next steps:</p>
+                <ol style="color:#6b7280;font-size:14px;padding-left:20px">
+                  <li>Test your connection with: <code>/debug/ping-kite?userId={user_id_str}</code></li>
+                  <li>Fetch your portfolio: <code>/debug/holdings?userId={user_id_str}</code></li>
+                  <li>Trigger data sync: <code>/debug/refresh?userId={user_id_str}</code></li>
+                </ol>
+              </div>
+              
+              <p style="margin-top:24px;color:#9ca3af;font-size:12px">
+                You can close this tab now.
+              </p>
+            </div>
+          </body>
+        </html>
+        """
+    )
+    
+    # Add to app/main.py
+
+@app.get("/zerodha/connect", response_class=HTMLResponse)
+async def zerodha_connect_page():
+    """
+    Show a page where users can paste their request token after Zerodha login.
+    This solves the redirect URL state parameter issue.
+    """
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Connect Zerodha - TradeBuddy</title>
+        <style>
+            body {
+                font-family: system-ui, -apple-system, sans-serif;
+                max-width: 600px;
+                margin: 50px auto;
+                padding: 20px;
+                background: #f0f9ff;
+            }
+            .container {
+                background: white;
+                padding: 32px;
+                border-radius: 12px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            }
+            h2 {
+                color: #1e40af;
+                margin-top: 0;
+            }
+            .step {
+                background: #eff6ff;
+                padding: 16px;
+                border-radius: 8px;
+                margin: 16px 0;
+                border-left: 4px solid #3b82f6;
+            }
+            input {
+                width: 100%;
+                padding: 12px;
+                margin: 8px 0;
+                border: 2px solid #e5e7eb;
+                border-radius: 6px;
+                font-size: 14px;
+                box-sizing: border-box;
+            }
+            button {
+                background: #10b981;
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 6px;
+                font-size: 16px;
+                cursor: pointer;
+                width: 100%;
+                margin-top: 16px;
+            }
+            button:hover {
+                background: #059669;
+            }
+            button:disabled {
+                background: #9ca3af;
+                cursor: not-allowed;
+            }
+            .success {
+                background: #ecfdf5;
+                color: #059669;
+                padding: 16px;
+                border-radius: 8px;
+                margin-top: 16px;
+                display: none;
+            }
+            .error {
+                background: #fef2f2;
+                color: #dc2626;
+                padding: 16px;
+                border-radius: 8px;
+                margin-top: 16px;
+                display: none;
+            }
+            code {
+                background: #f3f4f6;
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-size: 13px;
+            }
+            .login-btn {
+                background: #3b82f6;
+                margin-bottom: 24px;
+            }
+            .login-btn:hover {
+                background: #2563eb;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>🔗 Connect Zerodha Account</h2>
+            
+            <div class="step">
+                <strong>Step 1:</strong> Enter your phone number (with country code)
+            </div>
+            
+            <input type="text" id="phoneInput" placeholder="+919876543210" value="+91">
+            
+            <button class="login-btn" onclick="openZerodhaLogin()">
+                Open Zerodha Login
+            </button>
+            
+            <div class="step">
+                <strong>Step 2:</strong> After logging in to Zerodha, you'll be redirected to a page with an error. 
+                <br><br>
+                <strong>Copy the <code>request_token</code></strong> from the URL and paste it below.
+                <br><br>
+                Example URL:<br>
+                <code style="font-size:11px">http://localhost:8000/callback?request_token=<strong>ARzIw3...</strong></code>
+            </div>
+            
+            <input type="text" id="requestToken" placeholder="Paste request_token here">
+            
+            <button onclick="connectZerodha()" id="connectBtn">
+                ✅ Connect Zerodha
+            </button>
+            
+            <div class="success" id="successMsg"></div>
+            <div class="error" id="errorMsg"></div>
+        </div>
+        
+        <script>
+            async function openZerodhaLogin() {
+                const phone = document.getElementById('phoneInput').value.trim();
+                
+                if (!phone || phone === '+91') {
+                    alert('Please enter your phone number');
+                    return;
+                }
+                
+                try {
+                    // Create user and get login URL
+                    const response = await fetch(`/zerodha/login-url?phone=${encodeURIComponent(phone)}`);
+                    const data = await response.json();
+                    
+                    // Store userId in localStorage for next step
+                    localStorage.setItem('userId', data.userId);
+                    
+                    // Open Zerodha login in new tab
+                    window.open(data.loginUrl, '_blank');
+                    
+                    alert('Zerodha login opened in new tab. After logging in, come back here and paste the request_token.');
+                } catch (error) {
+                    document.getElementById('errorMsg').textContent = 'Error: ' + error.message;
+                    document.getElementById('errorMsg').style.display = 'block';
+                }
+            }
+            
+            async function connectZerodha() {
+                const requestToken = document.getElementById('requestToken').value.trim();
+                const userId = localStorage.getItem('userId');
+                
+                if (!requestToken) {
+                    alert('Please paste the request_token from the redirect URL');
+                    return;
+                }
+                
+                if (!userId) {
+                    alert('Please click "Open Zerodha Login" first');
+                    return;
+                }
+                
+                const btn = document.getElementById('connectBtn');
+                btn.disabled = true;
+                btn.textContent = 'Connecting...';
+                
+                try {
+                    const response = await fetch(
+                        `/debug/kite-exchange?userId=${userId}&requestToken=${requestToken}`,
+                        { method: 'POST' }
+                    );
+                    
+                    const data = await response.json();
+                    
+                    if (data.ok) {
+                        document.getElementById('successMsg').innerHTML = `
+                            <strong>✅ Success!</strong><br><br>
+                            Your Zerodha account is now connected!<br><br>
+                            <strong>User ID:</strong> ${userId}<br><br>
+                            You can now close this page and start using TradeBuddy.
+                        `;
+                        document.getElementById('successMsg').style.display = 'block';
+                        document.getElementById('errorMsg').style.display = 'none';
+                        
+                        // Clear the form
+                        document.getElementById('requestToken').value = '';
+                    } else {
+                        throw new Error(data.error || 'Connection failed');
+                    }
+                } catch (error) {
+                    document.getElementById('errorMsg').textContent = 'Error: ' + error.message;
+                    document.getElementById('errorMsg').style.display = 'block';
+                    document.getElementById('successMsg').style.display = 'none';
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = '✅ Connect Zerodha';
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """)
+    
+    
+@app.post("/zerodha/exchange-token")
+async def exchange_token_simple(userId: str, requestToken: str):
+    """
+    Simple endpoint to exchange Zerodha request token for access token.
+    
+    Usage:
+    POST /zerodha/exchange-token?userId=XXX&requestToken=YYY
+    """
+    try:
+        user_id = ObjectId(userId)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+    
+    # Exchange token
+    try:
+        tokens = exchange_request_token_for_access_token(requestToken)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Token exchange failed: {str(e)}")
+    
+    # Save to database
+    await app.state.mongodb["connections"].update_one(
+        {"userId": user_id, "provider": "zerodha"},
+        {"$set": {
+            "userId": user_id,
+            "provider": "zerodha",
+            "apiKey": settings.kite_api_key,
+            "apiSecret": settings.kite_api_secret,
+            "accessToken": tokens["access_token"],
+            "publicToken": tokens.get("public_token"),
+            "scopes": ["read"],
+            "enabled": True,
+            "createdAt": dt.datetime.now(timezone.utc),
+        }},
+        upsert=True
+    )
+    
+    return {
+        "success": True,
+        "userId": userId,
+        "message": "Zerodha connected successfully!"
+    }
