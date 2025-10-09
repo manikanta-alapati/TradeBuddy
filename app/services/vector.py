@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 
 EMBEDDINGS_COLL = "embeddings"
 
@@ -77,7 +77,7 @@ async def upsert_embedding(
         "vector": vector,
         "chunk": chunk,
         "meta": metadata or {},
-        "updatedAt": datetime.utcnow(),
+        "updatedAt": datetime.now(timezone.utc),
     }
     res = await db[EMBEDDINGS_COLL].update_one(
         {"userId": user_id, "kind": kind, "docId": doc_id},

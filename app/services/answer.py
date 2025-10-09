@@ -18,37 +18,60 @@ def get_client() -> OpenAI:
 def answer_with_context(
     question: str,
     context_chunks: List[Dict],
-    persona: Persona = "professional",
+    persona: Persona = "friendly",
     max_chars_context: int = 7000,
+    response_style: str = "whatsapp",
+    conversation_history: str = None  # Changed to string (already formatted)
 ) -> str:
     """
-    Build the full prompt and call the chat model. Truncates context if huge.
+    Build the full prompt and call the chat model.
     """
+    print(f"[DEBUG answer_with_context] conversation_history received: {conversation_history is not None}")
+    if conversation_history:
+        print(f"[DEBUG] History length: {len(conversation_history)}")
+        print(f"[DEBUG] First 300 chars: {conversation_history[:300]}")
     system = build_system_prompt(persona)
     ctx = render_context(context_chunks)
     if len(ctx) > max_chars_context:
         ctx = ctx[:max_chars_context] + "\n...[truncated]"
 
-    user_message = f"""\
-USER QUESTION:
-{question}
-
-CONTEXT:
-{ctx}
-
-INSTRUCTIONS:
-- Answer using only the CONTEXT above. If insufficient, say what else you need.
-- If numbers are asked, surface them clearly.
-- If user asked "refresh", reply: "Refresh requested — please trigger the refresh job." and stop.
+    # Build messages array
+    messages = [{"role": "system", "content": system}]
+    
+    # Add conversation history if exists
+    if conversation_history:
+        messages.append({
+            "role": "system",
+            "content": f"[CONVERSATION HISTORY]\n{conversation_history}\n"
+        })
+    
+    # Add portfolio context
+    messages.append({
+        "role": "system", 
+        "content": f"[USER'S PORTFOLIO DATA]\n{ctx}\n"
+    })
+    
+    # Length instruction based on response style
+    length_instruction = ""
+    if response_style == "whatsapp":
+        length_instruction = """
+RESPONSE LENGTH (CRITICAL FOR WHATSAPP):
+- Keep responses SHORT (2-4 sentences for simple questions)
+- Use line breaks for readability
+- Brief answer + offer to explain more if needed
 """
+    
+    # Add current question
+    messages.append({
+        "role": "user",
+        "content": f"{question}\n{length_instruction}"
+    })
 
     client = get_client()
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=0.2,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=300 if response_style == "whatsapp" else 1000
     )
     return resp.choices[0].message.content.strip()

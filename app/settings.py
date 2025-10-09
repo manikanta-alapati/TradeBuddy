@@ -24,7 +24,9 @@ class Settings(BaseSettings):
     twilio_account_sid: str | None = None
     twilio_auth_token: str | None = None
     twilio_whatsapp_number: str | None = None
-
+    
+    # Add this field
+    app_url: str = "https://52e35f90f006.ngrok-free.app"  # Update this with your ngrok/production URL
     # IMPORTANT: ignore extra keys in .env to avoid crashes
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -81,6 +81,9 @@ async def ensure_indexes() -> None:
 
     # EMBEDDINGS (Atlas Vector Search will add a Search index via Atlas UI/API)
     await db[EMBEDDINGS].create_index([("userId", 1), ("kind", 1), ("docId", 1)])
+    
+    await db["messages"].create_index([("userId", 1), ("ts", -1), ("archived", 1)])
+    await db["users"].create_index([("lastMilestoneNotified", 1)])
 
     client.close()
 

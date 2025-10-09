@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import datetime as dt
 from typing import List
 
+from fastapi import Form
+from fastapi.responses import Response
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -257,18 +259,42 @@ async def debug_search_text(userId: str, query: str, k: int = 3, kind: str = "po
 # ---------------- ask ----------------
 
 @app.post("/ask")
-async def ask(req: AskReq):
-    if "refresh" in req.question.lower():
-        return {"answer": "Refresh requested — please trigger the refresh job."}
-
+async def ask(req: AskReq, responseStyle: str = "whatsapp"):
+    """
+    Ask a question with full conversation memory and milestone tracking.
+    """
+    from app.services.conversation import (
+        get_conversation_context,
+        handle_message_with_context,
+        format_conversation_for_llm
+    )
+    
     user_id = ObjectId(req.userId)
 
-    # 1) retrieve internal context (vector search)
-    chunks = await retrieve_context(app.state.mongodb, user_id=user_id, question=req.question, k=req.k, kind=req.kind)
+    # 0) Get smart conversation context
+    conversation_messages, context_type = await get_conversation_context(
+        app.state.mongodb,
+        user_id,
+        max_tokens=16000
+    )
+    
+    # Format for LLM
+    conversation_history = format_conversation_for_llm(conversation_messages)
 
-    # 2) optional web search
+    # 1) Retrieve portfolio context (vector search)
+    chunks = await retrieve_context(
+        app.state.mongodb, 
+        user_id=user_id, 
+        question=req.question, 
+        k=req.k, 
+        kind=req.kind
+    )
+
+    # 2) Optional web search
     q_low = req.question.lower()
-    wants_search = q_low.startswith("search:") or any(t in q_low for t in ["news", "market", "today", "headline", "analysis"])
+    wants_search = q_low.startswith("search:") or any(
+        t in q_low for t in ["news", "market", "today", "headline", "analysis", "current", "latest"]
+    )
     if wants_search:
         webq = req.question[7:].strip() if q_low.startswith("search:") else req.question
         web_chunks = web_search(webq, k=3)
@@ -276,17 +302,34 @@ async def ask(req: AskReq):
             wc["docId"] = f"{wc['docId']} (web)"
         chunks = (chunks or []) + web_chunks
 
-    # 3) answer
-    answer = answer_with_context(req.question, chunks, persona=req.persona)
+    # 3) Generate answer with conversation context
+    answer = answer_with_context(
+        req.question, 
+        chunks, 
+        persona=req.persona,
+        response_style=responseStyle,
+        conversation_history=conversation_history
+    )
 
-    # 4) minimal logging
-    await app.state.mongodb["messages"].insert_many([
-        {"userId": user_id, "role": "user", "text": req.question},
-        {"userId": user_id, "role": "assistant", "text": answer},
-    ])
-
-    return {"answer": answer, "usedChunks": chunks}
-
+    # 4) Store message and check milestones
+    result = await handle_message_with_context(
+        app.state.mongodb,
+        user_id,
+        req.question,
+        answer
+    )
+    
+    response = {
+        "answer": answer,
+        "usedChunks": chunks,
+        "contextType": context_type
+    }
+    
+    # Add milestone notification if triggered
+    if result.get("milestone"):
+        response["milestone"] = result["milestone"]["message"]
+    
+    return response
 # ---------------- seed trades ----------------
 
 @app.post("/debug/seed-trades")
@@ -522,62 +565,50 @@ async def get_zerodha_login_url(phone: str):
 
 # Update the existing /callback endpoint to handle state parameter
 
-@app.get("/callback", response_class=HTMLResponse)
-async def kite_callback(request: Request):
+@app.get("/auth/callback", response_class=HTMLResponse)
+async def auth_callback(request: Request):
     """
-    Zerodha redirects here after login:
-    /callback?status=success&request_token=XXXX&action=login&state=USER_ID
+    OAuth callback from Zerodha.
+    Handles the redirect and sends WhatsApp confirmation.
     """
     q = request.query_params
     request_token = q.get("request_token")
     status = q.get("status")
-    user_id_str = q.get("state") or q.get("userId")  # Try both
+    state = q.get("state")
     
-    # Check status
     if status != "success":
-        return HTMLResponse(
-            """
-            <html>
-              <body style="font-family:system-ui;padding:24px">
+        return HTMLResponse("""
+            <html><body style="font-family:system-ui;padding:24px;text-align:center">
                 <h2>❌ Login Failed</h2>
-                <p>Zerodha login was cancelled or failed.</p>
-                <p>Please try again.</p>
-              </body>
-            </html>
-            """
-        )
+                <p>Please go back to WhatsApp and type "login" to try again.</p>
+            </body></html>
+        """)
     
-    if not request_token:
-        raise HTTPException(status_code=400, detail="Missing request_token")
+    if not request_token or not state:
+        raise HTTPException(status_code=400, detail="Missing parameters")
     
-    if not user_id_str:
-        raise HTTPException(
-            status_code=400, 
-            detail="Missing userId. Please use the login URL from /zerodha/login-url endpoint"
-        )
-    
+    # Decode state to get userId and phone
     try:
+        import base64
+        decoded = base64.b64decode(state).decode()
+        user_id_str, phone = decoded.split("|")
         user_id = ObjectId(user_id_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid userId format")
+    except:
+        raise HTTPException(status_code=400, detail="Invalid state")
     
-    # Exchange request token for access token
+    # Exchange token
     try:
         tokens = exchange_request_token_for_access_token(request_token)
     except Exception as e:
-        return HTMLResponse(
-            f"""
-            <html>
-              <body style="font-family:system-ui;padding:24px">
-                <h2>❌ Token Exchange Failed</h2>
-                <p>Error: {str(e)}</p>
-                <p>Make sure your API key and secret are correct in .env file.</p>
-              </body>
-            </html>
-            """
-        )
+        return HTMLResponse(f"""
+            <html><body style="font-family:system-ui;padding:24px">
+                <h2>❌ Connection Failed</h2>
+                <p>{str(e)}</p>
+                <p>Go back to WhatsApp and type "login" to try again.</p>
+            </body></html>
+        """)
     
-    # Save to database
+    # Save connection
     db = request.app.state.mongodb
     await db["connections"].update_one(
         {"userId": user_id, "provider": "zerodha"},
@@ -595,49 +626,39 @@ async def kite_callback(request: Request):
         upsert=True,
     )
     
-    # Get user phone for display
-    user = await db["users"].find_one({"_id": user_id})
-    phone = user.get("phone", "Unknown") if user else "Unknown"
+    # Send WhatsApp notification
+    try:
+        from app.services.whatsapp import send_whatsapp_message
+        send_whatsapp_message(
+            f"whatsapp:{phone}",
+            """
+✅ **Zerodha Connected!**
+
+Your account is linked! Go back to WhatsApp and type "done" to continue.
+
+Then I'll be your personal financial advisor! 💀
+"""
+        )
+    except:
+        pass  # Continue even if WhatsApp message fails
     
-    return HTMLResponse(
-        f"""
+    # Show success page
+    return HTMLResponse("""
         <html>
-          <body style="font-family:system-ui;padding:24px;background:#f0f9ff">
-            <div style="max-width:600px;margin:0 auto;background:white;padding:32px;border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,0.1)">
-              <h2 style="color:#10b981;margin:0 0 16px 0">✅ Zerodha Connected!</h2>
-              
-              <div style="background:#ecfdf5;padding:16px;border-radius:8px;margin:16px 0">
-                <p style="margin:0;color:#059669"><strong>User:</strong> {phone}</p>
-                <p style="margin:8px 0 0 0;color:#059669;font-size:12px"><strong>User ID:</strong> {user_id_str}</p>
+          <body style="font-family:system-ui;padding:40px;text-align:center;background:#f0f9ff">
+            <div style="max-width:500px;margin:0 auto;background:white;padding:32px;border-radius:12px">
+              <h1 style="color:#10b981;font-size:48px;margin:0">✅</h1>
+              <h2 style="color:#10b981;margin:16px 0">Connected!</h2>
+              <p style="color:#374151;font-size:18px">Your Zerodha account is now linked to TradeBuddy.</p>
+              <div style="background:#ecfdf5;padding:16px;border-radius:8px;margin:24px 0">
+                <p style="color:#059669;margin:0;font-weight:600">Go back to WhatsApp</p>
+                <p style="color:#059669;margin:8px 0 0 0">Type "done" to continue</p>
               </div>
-              
-              <p style="color:#374151">Your Zerodha account is now connected to TradeBuddy!</p>
-              
-              <div style="margin-top:24px;padding:16px;background:#fef3c7;border-radius:8px">
-                <p style="margin:0;color:#92400e"><strong>⚠️ Important:</strong></p>
-                <p style="margin:8px 0 0 0;color:#92400e;font-size:14px">
-                  Zerodha access tokens expire daily. You'll need to re-login tomorrow.
-                </p>
-              </div>
-              
-              <div style="margin-top:24px">
-                <p style="color:#6b7280;font-size:14px">Next steps:</p>
-                <ol style="color:#6b7280;font-size:14px;padding-left:20px">
-                  <li>Test your connection with: <code>/debug/ping-kite?userId={user_id_str}</code></li>
-                  <li>Fetch your portfolio: <code>/debug/holdings?userId={user_id_str}</code></li>
-                  <li>Trigger data sync: <code>/debug/refresh?userId={user_id_str}</code></li>
-                </ol>
-              </div>
-              
-              <p style="margin-top:24px;color:#9ca3af;font-size:12px">
-                You can close this tab now.
-              </p>
+              <p style="color:#9ca3af;font-size:14px;margin-top:24px">You can close this page now.</p>
             </div>
           </body>
         </html>
-        """
-    )
-    
+    """)
     # Add to app/main.py
 
 @app.get("/zerodha/connect", response_class=HTMLResponse)
@@ -909,4 +930,125 @@ async def generate_embeddings_manually(userId: str):
     user_id = ObjectId(userId)
     result = await build_embeddings_for_user(app.state.mongodb, user_id)
     
+    return result
+
+#----------new session-----
+@app.post("/conversation/new-session")
+async def create_new_session(userId: str):
+    """
+    Start a fresh conversation session.
+    Archives old messages but keeps them searchable.
+    """
+    from app.services.conversation import start_new_session
+    
+    user_id = ObjectId(userId)
+    result = await start_new_session(app.state.mongodb, user_id)
+    
+    return result
+
+@app.get("/debug/conversation-history")
+async def debug_conversation_history(userId: str, limit: int = 20):
+    """Debug: See recent conversation history"""
+    user_id = ObjectId(userId)
+    
+    messages = await app.state.mongodb["messages"].find(
+        {"userId": user_id}
+    ).sort("ts", -1).limit(limit).to_list(None)
+    
+    result = []
+    for msg in messages:
+        result.append({
+            "role": msg.get("role"),
+            "text": msg.get("text"),
+            "ts": msg.get("ts").isoformat() if msg.get("ts") else None
+        })
+    
+    return {
+        "total": len(result),
+        "messages": result
+    }
+    
+
+@app.get("/debug/conversation-context")
+async def debug_conversation_context(userId: str):
+    """Debug: See what context is being retrieved"""
+    user_id = ObjectId(userId)
+    
+    # Get message count first
+    count = await app.state.mongodb["messages"].count_documents({"userId": user_id})
+    
+    # Get recent messages directly
+    messages = await app.state.mongodb["messages"].find(
+        {"userId": user_id}
+    ).sort("ts", -1).limit(50).to_list(None)
+    
+    # Format manually
+    formatted_lines = []
+    for msg in messages:
+        role = msg.get("role", "user").upper()
+        text = msg.get("text", "")
+        formatted_lines.append(f"{role}: {text}")
+    
+    formatted = "\n".join(formatted_lines)
+    
+    return {
+        "messageCount": len(messages),
+        "totalCount": count,
+        "formattedHistory": formatted
+    }
+
+
+
+# Add these endpoints
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(
+    From: str = Form(...),
+    To: str = Form(...),
+    Body: str = Form(...),
+    MessageSid: str = Form(None),
+    NumMedia: str = Form("0"),
+    ProfileName: str = Form("User")
+):
+    """
+    Twilio WhatsApp webhook endpoint.
+    Receives incoming messages and responds.
+    """
+    from app.services.whatsapp import parse_incoming_whatsapp, create_twiml_response
+    from app.services.whatsapp_handler import handle_whatsapp_message
+    
+    # Parse incoming message
+    form_data = {
+        "From": From,
+        "To": To,
+        "Body": Body,
+        "MessageSid": MessageSid,
+        "NumMedia": NumMedia,
+        "ProfileName": ProfileName
+    }
+    
+    parsed = parse_incoming_whatsapp(form_data)
+    
+    # Handle message
+    response_text = await handle_whatsapp_message(
+        app.state.mongodb,
+        phone=parsed["from"],
+        message=parsed["body"],
+        profile_name=parsed["profile_name"]
+    )
+    
+    # Return TwiML response
+    twiml = create_twiml_response(response_text)
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/whatsapp/send")
+async def send_whatsapp_test(to: str, message: str):
+    """
+    Test endpoint to send WhatsApp messages.
+    Usage: POST /whatsapp/send?to=%2B1234567890&message=Hello
+    """
+    from app.services.whatsapp import send_whatsapp_message
+    
+    result = send_whatsapp_message(to, message)
     return result

@@ -2,6 +2,8 @@
 from __future__ import annotations
 import datetime as dt
 from datetime import timezone
+import traceback
+
 from typing import Dict, Any, List
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -173,35 +175,36 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
             total_pnl_pct = (total_pnl / total_investment * 100) if total_investment > 0 else 0
             holdings_breakdown = "\n".join(holdings_text_parts)
 
-            portfolio_summary = f"""Portfolio Overview:
-Total Holdings: {len(holdings)} stocks
-Total Investment: Rs.{total_investment:,.2f}
-Current Value: Rs.{total_value:,.2f}
-Total P&L: Rs.{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)
-
-Holdings Breakdown:
-{holdings_breakdown}
-
-Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-"""
+            portfolio_summary = (
+                "Portfolio Overview:\n"
+                f"Total Holdings: {len(holdings)} stocks\n"
+                f"Total Investment: Rs.{total_investment:,.2f}\n"
+                f"Current Value: Rs.{total_value:,.2f}\n"
+                f"Total P&L: Rs.{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)\n"
+                "\n"
+                "Holdings Breakdown:\n"
+                f"{holdings_breakdown}\n"
+                "\n"
+                f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+)
             
             # Generate embedding and store
             portfolio_vector = embed_text(portfolio_summary)
-            
+
             await upsert_embedding(
-    db,
-    user_id=user_id,
-    kind="portfolio_summary",
-    doc_id=f"portfolio-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-    vector=portfolio_vector,
-    chunk=portfolio_summary,
-    metadata={
-        "totalValue": total_value,
-        "totalPnL": total_pnl,
-        "holdingsCount": len(holdings),
-        "generatedAt": datetime.now(timezone.utc).isoformat()  # ← Changed to .isoformat()
-    }
-)
+                db,
+                user_id=user_id,
+                kind="portfolio_summary",
+                doc_id=f"portfolio-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                vector=portfolio_vector,
+                chunk=portfolio_summary,
+                metadata={
+                    "totalValue": total_value,
+                    "totalPnL": total_pnl,
+                    "holdingsCount": len(holdings),
+                    "generatedAt": datetime.now(timezone.utc).isoformat()
+                }
+            )
             
             embeddings_created += 1
         
@@ -211,11 +214,16 @@ Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
         
         funds = await db["funds"].find({"userId": user_id}).to_list(None)
         
+        
+        
         if funds:
             funds_parts = []
             for f in funds:
                 segment = f.get("segment", "EQUITY")
                 available = f.get("available", 0)
+
+                if isinstance(available, dict):
+                    available = available.get("cash", 0)
                 net = f.get("net", 0)
                 
                 funds_parts.append(
@@ -224,25 +232,26 @@ Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
             
             funds_breakdown = "\n".join(funds_parts)
 
-            funds_summary = f"""Account Funds:
-{funds_breakdown}
-
-Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-"""
+            funds_summary = (
+                "Account Funds:\n"
+                f"{funds_breakdown}\n"
+                "\n"
+                f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+)
             
             funds_vector = embed_text(funds_summary)
-            
+
             await upsert_embedding(
-    db,
-    user_id=user_id,
-    kind="funds_summary",
-    doc_id=f"funds-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-    vector=funds_vector,
-    chunk=funds_summary,
-    metadata={
-        "generatedAt": datetime.now(timezone.utc).isoformat()  # ← Changed to .isoformat()
-    }
-)
+                db,
+                user_id=user_id,
+                kind="funds_summary",
+                doc_id=f"funds-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                vector=funds_vector,
+                chunk=funds_summary,
+                metadata={
+                    "generatedAt": datetime.now(timezone.utc).isoformat()
+                }
+            )
             
             embeddings_created += 1
         
@@ -295,32 +304,33 @@ Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
                 current_price = holding.get("lastPrice", 0) if holding else 0
                 current_qty = holding.get("qty", 0) if holding else 0
                 
-                symbol_summary = f"""{symbol} Trading Activity (Last 3 Months):
-Total Trades: {len(trades_list)}
-Total Quantity Traded: {total_qty}
-Current Holding: {current_qty} shares at Rs.{current_price:.2f}
-Trade Volume: Rs.{buy_amount:,.2f}
-
-Recent Activity: {len(trades_list)} trades executed in the last 90 days.
-
-Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-"""
+                symbol_summary = (
+                    f"{symbol} Trading Activity (Last 3 Months):\n"
+                    f"Total Trades: {len(trades_list)}\n"
+                    f"Total Quantity Traded: {total_qty}\n"
+                    f"Current Holding: {current_qty} shares at Rs.{current_price:.2f}\n"
+                    f"Trade Volume: Rs.{buy_amount:,.2f}\n"
+                    "\n"
+                    f"Recent Activity: {len(trades_list)} trades executed in the last 90 days.\n"
+                    "\n"
+                    f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+)
                 
                 symbol_vector = embed_text(symbol_summary)
-                
+
                 await upsert_embedding(
-    db,
-    user_id=user_id,
-    kind="symbol_summary",
-    doc_id=f"{symbol}-recent",
-    vector=symbol_vector,
-    chunk=symbol_summary,
-    metadata={
-        "symbol": symbol,
-        "tradesCount": len(trades_list),
-        "generatedAt": datetime.now(timezone.utc).isoformat()  # ← Changed to .isoformat()
-    }
-)
+                    db,
+                    user_id=user_id,
+                    kind="symbol_summary",
+                    doc_id=f"{symbol}-recent",
+                    vector=symbol_vector,
+                    chunk=symbol_summary,
+                    metadata={
+                        "symbol": symbol,
+                        "tradesCount": len(trades_list),
+                        "generatedAt": datetime.now(timezone.utc).isoformat()
+                    }
+                )
                 
                 embeddings_created += 1
         
@@ -349,37 +359,40 @@ Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
             if positions_parts:
                 positions_breakdown = "\n".join(positions_parts)
 
-                positions_summary = f"""Current Day Positions:
-Total Day P&L: Rs.{total_day_pnl:,.2f}
-
-Active Positions:
-{positions_breakdown}
-
-Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-"""
+                positions_summary = (
+                    "Current Day Positions:\n"
+                    f"Total Day P&L: Rs.{total_day_pnl:,.2f}\n"
+                    "\n"
+                    "Active Positions:\n"
+                    f"{positions_breakdown}\n"
+                    "\n"
+                    f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+)
 
                 
                 positions_vector = embed_text(positions_summary)
-                
+
                 await upsert_embedding(
-    db,
-    user_id=user_id,
-    kind="positions_summary",
-    doc_id=f"positions-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-    vector=positions_vector,
-    chunk=positions_summary,
-    metadata={
-        "dayPnL": total_day_pnl,
-        "positionsCount": len(positions_parts),
-        "generatedAt": datetime.now(timezone.utc).isoformat()  # ← Changed to .isoformat()
-    }
-)
+                    db,
+                    user_id=user_id,
+                    kind="positions_summary",
+                    doc_id=f"positions-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                    vector=positions_vector,
+                    chunk=positions_summary,
+                    metadata={
+                        "dayPnL": total_day_pnl,
+                        "positionsCount": len(positions_parts),
+                        "generatedAt": datetime.now(timezone.utc).isoformat()
+                    }
+                )
                 
                 embeddings_created += 1
         
     except Exception as e:
+        error_detail = traceback.format_exc()
         errors.append(str(e))
-        print(f"[Embeddings] Error for user {user_id}: {e}")
+        print(f"[Embeddings] FULL ERROR for user {user_id}:")
+        print(error_detail)
     
     return {
         "userId": str(user_id),
