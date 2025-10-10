@@ -63,13 +63,16 @@ def map_orders(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def map_trades(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for t in raw:
-        ts = t.get("trade_timestamp") or t.get("timestamp")
+        # Handle both trade format and order format
+        ts = t.get("trade_timestamp") or t.get("order_timestamp") or t.get("timestamp") or t.get("ts")
+        
         out.append({
-            "tradeId": t.get("trade_id"),
-            "orderId": t.get("order_id"),
-            "symbol": t.get("tradingsymbol"),
-            "qty": t.get("quantity", 0),
-            "price": t.get("price", 0.0),
+            "tradeId": t.get("trade_id") or t.get("tradeId") or t.get("order_id"),
+            "orderId": t.get("order_id") or t.get("orderId"),
+            "symbol": t.get("tradingsymbol") or t.get("symbol"),
+            "side": t.get("transaction_type") or t.get("side"),  # BUY/SELL
+            "qty": t.get("quantity") or t.get("filled_quantity") or t.get("qty", 0),
+            "price": t.get("price") or t.get("average_price", 0.0),
             "ts": ts,
         })
     return out

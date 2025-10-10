@@ -92,7 +92,7 @@ class ConnectZerodhaReq(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.mongodb = await connect_to_mongo()
-
+    app.state.temp_tokens = {} 
     # import here to avoid early import cycles
     from app.services.sync import run_incremental_sync, build_embeddings_for_user
 
@@ -569,12 +569,12 @@ async def get_zerodha_login_url(phone: str):
 async def auth_callback(request: Request):
     """
     OAuth callback from Zerodha.
-    Handles the redirect and sends WhatsApp confirmation.
+    Stores request_token temporarily WITHOUT requiring state parameter.
+    User will identify themselves by typing "done" in WhatsApp.
     """
     q = request.query_params
     request_token = q.get("request_token")
     status = q.get("status")
-    state = q.get("state")
     
     if status != "success":
         return HTMLResponse("""
@@ -584,63 +584,18 @@ async def auth_callback(request: Request):
             </body></html>
         """)
     
-    if not request_token or not state:
-        raise HTTPException(status_code=400, detail="Missing parameters")
+    if not request_token:
+        raise HTTPException(status_code=400, detail="Missing request_token")
     
-    # Decode state to get userId and phone
-    try:
-        import base64
-        decoded = base64.b64decode(state).decode()
-        user_id_str, phone = decoded.split("|")
-        user_id = ObjectId(user_id_str)
-    except:
-        raise HTTPException(status_code=400, detail="Invalid state")
+    # Store request_token temporarily WITHOUT phone number
+    # User will claim it by typing "done" within 5 minutes
+    request.app.state.temp_tokens[request_token] = {
+        "phone": None,  # Will be claimed by whoever types "done" first
+        "timestamp": dt.datetime.now(timezone.utc).timestamp(),
+        "used": False
+    }
     
-    # Exchange token
-    try:
-        tokens = exchange_request_token_for_access_token(request_token)
-    except Exception as e:
-        return HTMLResponse(f"""
-            <html><body style="font-family:system-ui;padding:24px">
-                <h2>❌ Connection Failed</h2>
-                <p>{str(e)}</p>
-                <p>Go back to WhatsApp and type "login" to try again.</p>
-            </body></html>
-        """)
-    
-    # Save connection
-    db = request.app.state.mongodb
-    await db["connections"].update_one(
-        {"userId": user_id, "provider": "zerodha"},
-        {"$set": {
-            "userId": user_id,
-            "provider": "zerodha",
-            "apiKey": settings.kite_api_key,
-            "apiSecret": settings.kite_api_secret,
-            "accessToken": tokens["access_token"],
-            "publicToken": tokens.get("public_token"),
-            "scopes": ["read"],
-            "enabled": True,
-            "createdAt": dt.datetime.now(timezone.utc),
-        }},
-        upsert=True,
-    )
-    
-    # Send WhatsApp notification
-    try:
-        from app.services.whatsapp import send_whatsapp_message
-        send_whatsapp_message(
-            f"whatsapp:{phone}",
-            """
-✅ **Zerodha Connected!**
-
-Your account is linked! Go back to WhatsApp and type "done" to continue.
-
-Then I'll be your personal financial advisor! 💀
-"""
-        )
-    except:
-        pass  # Continue even if WhatsApp message fails
+    print(f"✅ Request token stored: {request_token[:20]}...")
     
     # Show success page
     return HTMLResponse("""
@@ -648,18 +603,20 @@ Then I'll be your personal financial advisor! 💀
           <body style="font-family:system-ui;padding:40px;text-align:center;background:#f0f9ff">
             <div style="max-width:500px;margin:0 auto;background:white;padding:32px;border-radius:12px">
               <h1 style="color:#10b981;font-size:48px;margin:0">✅</h1>
-              <h2 style="color:#10b981;margin:16px 0">Connected!</h2>
-              <p style="color:#374151;font-size:18px">Your Zerodha account is now linked to TradeBuddy.</p>
+              <h2 style="color:#10b981;margin:16px 0">Login Successful!</h2>
+              <p style="color:#374151;font-size:18px">Your Zerodha login was successful.</p>
               <div style="background:#ecfdf5;padding:16px;border-radius:8px;margin:24px 0">
-                <p style="color:#059669;margin:0;font-weight:600">Go back to WhatsApp</p>
-                <p style="color:#059669;margin:8px 0 0 0">Type "done" to continue</p>
+                <p style="color:#059669;margin:0;font-weight:600">📱 Go back to WhatsApp</p>
+                <p style="color:#059669;margin:8px 0 0 0;font-size:20px;font-weight:700">Type: done</p>
               </div>
-              <p style="color:#9ca3af;font-size:14px;margin-top:24px">You can close this page now.</p>
+              <p style="color:#9ca3af;font-size:14px;margin-top:24px">
+                ⏱️ You have 5 minutes to complete this step
+              </p>
+              <p style="color:#9ca3af;font-size:12px;margin-top:8px">You can close this page now.</p>
             </div>
           </body>
         </html>
     """)
-    # Add to app/main.py
 
 @app.get("/zerodha/connect", response_class=HTMLResponse)
 async def zerodha_connect_page():
@@ -1001,7 +958,7 @@ async def debug_conversation_context(userId: str):
 
 # Add these endpoints
 
-@app.post("/whatsapp/webhook")
+@app.post("/whatsapp/webhook")  # Make sure this matches Twilio's webhook URL
 async def whatsapp_webhook(
     From: str = Form(...),
     To: str = Form(...),
@@ -1032,7 +989,7 @@ async def whatsapp_webhook(
     # Handle message
     response_text = await handle_whatsapp_message(
         app.state.mongodb,
-        phone=parsed["from"],
+        phone=parsed["from"],  # This is already cleaned (without whatsapp:+)
         message=parsed["body"],
         profile_name=parsed["profile_name"]
     )
@@ -1052,3 +1009,111 @@ async def send_whatsapp_test(to: str, message: str):
     
     result = send_whatsapp_message(to, message)
     return result
+
+
+@app.get("/debug/zerodha-raw-data")
+async def debug_zerodha_raw_data(userId: str, request: Request):
+    """Get ALL raw data from Zerodha API to diagnose issues"""
+    from app.services.kite_client import build_kite_client
+    
+    db = request.app.state.mongodb
+    conn = await db["connections"].find_one({"userId": ObjectId(userId), "provider": "zerodha"})
+    
+    if not conn:
+        return {"error": "No connection found for this user"}
+    
+    kite = build_kite_client(conn.get("accessToken"), conn.get("apiKey"))
+    
+    result = {
+        "userId": userId,
+        "connectionFound": True
+    }
+    
+    # Test Holdings
+    try:
+        holdings = kite.get_holdings()
+        result["holdings"] = holdings
+        result["holdings_count"] = len(holdings)
+    except Exception as e:
+        result["holdings_error"] = str(e)
+        result["holdings_count"] = 0
+    
+    # Test Trades (THIS IS THE KEY!)
+    try:
+        trades = kite.get_trades()
+        result["trades"] = trades
+        result["trades_count"] = len(trades)
+    except Exception as e:
+        result["trades_error"] = str(e)
+        result["trades_count"] = 0
+    
+    # Test Orders
+    try:
+        orders = kite.get_orders()
+        result["orders"] = orders
+        result["orders_count"] = len(orders)
+    except Exception as e:
+        result["orders_error"] = str(e)
+        result["orders_count"] = 0
+    
+    # Test Positions
+    try:
+        positions = kite.get_positions()
+        result["positions_day"] = positions.get("day", [])
+        result["positions_net"] = positions.get("net", [])
+        result["positions_count"] = len(positions.get("day", [])) + len(positions.get("net", []))
+    except Exception as e:
+        result["positions_error"] = str(e)
+        result["positions_count"] = 0
+    
+    # Test Funds
+    try:
+        funds = kite.get_funds()
+        result["funds"] = funds
+    except Exception as e:
+        result["funds_error"] = str(e)
+    
+    return result
+
+
+@app.get("/debug/zerodha-orders-detail")
+async def debug_zerodha_orders_detail(userId: str, request: Request):
+    """Get detailed order history from Zerodha"""
+    from app.services.kite_client import build_kite_client
+    
+    db = request.app.state.mongodb
+    conn = await db["connections"].find_one({"userId": ObjectId(userId), "provider": "zerodha"})
+    
+    if not conn:
+        return {"error": "No connection"}
+    
+    kite = build_kite_client(conn.get("accessToken"), conn.get("apiKey"))
+    
+    try:
+        all_orders = kite.get_orders()
+        
+        # Separate by status
+        complete_orders = [o for o in all_orders if o.get('status') == 'COMPLETE']
+        other_orders = [o for o in all_orders if o.get('status') != 'COMPLETE']
+        
+        # Build trade history from complete orders
+        trade_history = []
+        for order in complete_orders:
+            trade_history.append({
+                "date": str(order.get('order_timestamp')),
+                "symbol": order.get('tradingsymbol'),
+                "side": order.get('transaction_type'),
+                "qty": order.get('filled_quantity'),
+                "price": order.get('average_price'),
+                "status": order.get('status')
+            })
+        
+        return {
+            "total_orders": len(all_orders),
+            "completed_orders": len(complete_orders),
+            "other_orders": len(other_orders),
+            "trade_history": trade_history,
+            "raw_sample": complete_orders[:3] if complete_orders else []
+        }
+    except Exception as e:
+        return {"error": str(e)}
