@@ -76,8 +76,8 @@ Here's how my memory works now:
 ✅ **I can search**: Specific topics from our entire history
 
 Examples:
-• "What's my portfolio?" → I answer naturally ✅
-• "What did we discuss about TCS last month?" → I'll search our history 🔍
+- "What's my portfolio?" → I answer naturally ✅
+- "What did we discuss about TCS last month?" → I'll search our history 🔍
 
 **Your choice:**
 [Continue] - Keep this conversation going
@@ -239,28 +239,35 @@ How can I help you today? 💬
     }
 
 
-def format_conversation_for_llm(messages: List[Dict]) -> str:
+def format_conversation_for_llm(messages: List[Dict]) -> List[Dict]:
     """
     Format message history for LLM context.
-    Returns formatted string of conversation history.
+    
+    UPDATED: Returns list of message objects instead of formatted string.
+    This allows LLM to properly understand conversation flow.
+    
+    Args:
+        messages: List of message documents from MongoDB
+        
+    Returns:
+        List of dicts with {"role": "user"|"assistant", "text": "..."}
     """
     if not messages:
-        return "[No previous conversation]"
+        return []
     
     formatted = []
     for msg in messages:
-        role = msg.get("role", "user").upper()
+        role = msg.get("role", "user")
         text = msg.get("text", "")
-        ts = msg.get("ts")
         
-        # Add timestamp for very old messages
-        if ts:
-            time_str = ts.strftime("%b %d")
-            formatted.append(f"[{time_str}] {role}: {text}")
-        else:
-            formatted.append(f"{role}: {text}")
+        # Only include non-empty messages
+        if text:
+            formatted.append({
+                "role": role,  # "user" or "assistant"
+                "text": text
+            })
     
-    return "\n".join(formatted)
+    return formatted
 
 
 # ============================================

@@ -1,4 +1,5 @@
-# app/services/sync.py
+# app/services/sync.py - UPDATED VERSION (Compatible with your imports)
+
 from __future__ import annotations
 import datetime as dt
 from datetime import timezone, timedelta
@@ -22,7 +23,7 @@ from app.services.upserts import (
     upsert_trades,
 )
 
-# Optional: lightweight "stale" check (can be improved later)
+# Optional: lightweight "stale" check
 async def _instruments_recent(db: AsyncIOMotorDatabase) -> bool:
     row = await db["meta"].find_one({"_id": "instruments_meta"})
     if not row:
@@ -30,7 +31,6 @@ async def _instruments_recent(db: AsyncIOMotorDatabase) -> bool:
     ts = row.get("updatedAt")
     if not ts:
         return False
-    # consider fresh if updated within the last 3 days
     return (dt.datetime.now(timezone.utc) - ts) < dt.timedelta(days=3)
 
 async def _mark_instruments_updated(db: AsyncIOMotorDatabase):
@@ -45,7 +45,7 @@ async def run_incremental_sync(
     user_id: ObjectId,
     *,
     force_instruments: bool = False,
-    skip_embeddings: bool = True,   # default fast
+    skip_embeddings: bool = True,
 ) -> Dict[str, Any]:
     """
     Fast path sync:
@@ -71,7 +71,6 @@ async def run_incremental_sync(
                 await _mark_instruments_updated(db)
                 changed.append({"doc": "instruments"})
         except Exception as e:
-            # Don't fail the whole sync if instruments are slow
             changed.append({"doc": "instruments", "error": str(e)})
 
     # 2) core user data (fast)
@@ -94,49 +93,33 @@ async def run_incremental_sync(
         changed.append({"doc": "positions", "error": str(e)})
 
     try:
-        await upsert_orders(db, user_id, map_orders(kite.get_orders()))
-        changed.append({"doc": "orders"})
-    except Exception as e:
-        changed.append({"doc": "orders", "error": str(e)})
-
-        
-        
-        
-        
-        
-    try:
         all_orders = kite.get_orders()
     
-    # Build trade history from completed orders
+        # Build trade history from completed orders
         trade_history = []
         for order in all_orders:
-        # Only include COMPLETE orders as trades
             if order.get('status') == 'COMPLETE' and order.get('filled_quantity', 0) > 0:
                 trade_history.append({
                     'tradeId': order.get('order_id'),
                     'orderId': order.get('order_id'),
                     'symbol': order.get('tradingsymbol'),
-                    'side': order.get('transaction_type'),  # BUY or SELL
+                    'side': order.get('transaction_type'),
                     'qty': order.get('filled_quantity'),
                     'price': order.get('average_price'),
                     'ts': order.get('order_timestamp')
-            })
+                })
     
-    # Upsert trades (from orders data)
+        # Upsert trades
         await upsert_trades(db, user_id, trade_history)
         changed.append({"doc": "trades", "count": len(trade_history)})
     
-    # Also save all orders separately
+        # Also save all orders
         await upsert_orders(db, user_id, map_orders(all_orders))
         changed.append({"doc": "orders", "count": len(all_orders)})
     
     except Exception as e:
         changed.append({"doc": "orders", "error": str(e)})
-        
-        
-        
 
-    # 3) embeddings are skipped here; background job handles it
     return {
         "userId": str(user_id),
         "syncedAt": dt.datetime.now(timezone.utc).isoformat(),
@@ -144,42 +127,36 @@ async def run_incremental_sync(
         "embeddings": "skipped" if skip_embeddings else "handled elsewhere"
     }
 
+
 async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId) -> Dict[str, Any]:
     """
-    Complete embeddings generation pipeline with TRADE HISTORY:
-    1. Generate portfolio summary
-    2. Generate trade history summaries (by month)
-    3. Generate symbol-month summaries
-    4. Convert to embeddings
-    5. Store in MongoDB
+    Complete embeddings generation pipeline with POSITIONS + TRADE HISTORY.
     
-    This makes your portfolio data AND trade history searchable with semantic queries.
+    UPDATED: Now includes positions (active trades) in portfolio summary.
     """
+    # ✅ USE YOUR ACTUAL IMPORTS (not the wrong ones I gave you!)
     from app.services.llm import embed_text
     from app.services.vector import upsert_embedding
-    from app.services.rollup import compute_symbol_month_rollups
-    from app.services.summarize import summarize_symbol_month
     from datetime import datetime, timezone
     
     embeddings_created = 0
     errors = []
     
-    # Get user phone for embedding metadata
-    user = await db["users"].find_one({"_id": user_id})
-    phone = user.get("phone") if user else None
-    
     try:
         # ============================================
-        # 1. PORTFOLIO SUMMARY EMBEDDING
+        # 1. PORTFOLIO SUMMARY (Holdings + Positions)
         # ============================================
         
-        # Fetch current holdings
+        # Get holdings (long-term)
         holdings = await db["holdings"].find({"userId": user_id}).to_list(None)
         
-        if holdings:
-            # Calculate portfolio metrics
-            total_value = 0
-            total_investment = 0
+        # Get positions (active trades)
+        positions = await db["positions"].find({"userId": user_id}).to_list(None)
+        
+        if holdings or positions:
+            # Calculate holdings metrics
+            holdings_value = 0
+            holdings_investment = 0
             holdings_text_parts = []
             
             for h in holdings:
@@ -192,59 +169,85 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
                 current_value = qty * last_price
                 pnl = current_value - investment
                 pnl_pct = (pnl / investment * 100) if investment > 0 else 0
-                allocation = (current_value / total_value * 100) if total_value > 0 else 0
                 
-                total_investment += investment
-                total_value += current_value
+                holdings_investment += investment
+                holdings_value += current_value
                 
-                # Create human-readable text for this holding
                 holdings_text_parts.append(
-                    f"{symbol}: {qty} shares @ avg ₹{avg_price:.2f}, "
-                    f"current ₹{last_price:.2f}, "
-                    f"P&L: ₹{pnl:,.2f} ({pnl_pct:+.2f}%), "
-                    f"Allocation: {allocation:.1f}% of portfolio"
+                    f"HOLDING - {symbol}: {qty} shares @ avg Rs.{avg_price:.2f}, "
+                    f"current Rs.{last_price:.2f}, "
+                    f"P&L: Rs.{pnl:,.2f} ({pnl_pct:+.2f}%)"
                 )
             
-            # Recalculate allocations now that we have total_value
-            for i, h in enumerate(holdings):
-                qty = h.get("qty", 0)
-                last_price = h.get("lastPrice", 0)
-                current_value = qty * last_price
-                allocation = (current_value / total_value * 100) if total_value > 0 else 0
+            # Calculate positions metrics
+            positions_value = 0
+            positions_investment = 0
+            positions_text_parts = []
+            
+            for p in positions:
+                qty = p.get("quantity", 0)
+                avg_price = p.get("average_price", 0)
+                last_price = p.get("last_price", 0)
+                symbol = p.get("tradingsymbol", "UNKNOWN")
+                product = p.get("product", "")
                 
-                # Update allocation in text
-                symbol = h.get("tradingsymbol", "UNKNOWN")
-                avg_price = h.get("avgPrice", 0)
                 investment = qty * avg_price
+                current_value = qty * last_price
                 pnl = current_value - investment
                 pnl_pct = (pnl / investment * 100) if investment > 0 else 0
                 
-                holdings_text_parts[i] = (
-                    f"{symbol}: {qty} shares @ avg ₹{avg_price:.2f}, "
-                    f"current ₹{last_price:.2f}, "
-                    f"P&L: ₹{pnl:,.2f} ({pnl_pct:+.2f}%), "
-                    f"Allocation: {allocation:.1f}%"
+                positions_investment += investment
+                positions_value += current_value
+                
+                positions_text_parts.append(
+                    f"POSITION ({product}) - {symbol}: {qty} @ avg Rs.{avg_price:.2f}, "
+                    f"current Rs.{last_price:.2f}, "
+                    f"P&L: Rs.{pnl:,.2f} ({pnl_pct:+.2f}%)"
                 )
             
-            # Overall portfolio summary
+            # Total calculations
+            total_investment = holdings_investment + positions_investment
+            total_value = holdings_value + positions_value
             total_pnl = total_value - total_investment
             total_pnl_pct = (total_pnl / total_investment * 100) if total_investment > 0 else 0
-            holdings_breakdown = "\n".join(holdings_text_parts)
-
+            
+            # Build comprehensive summary
             portfolio_summary = (
-                "CURRENT PORTFOLIO OVERVIEW:\n"
-                f"Total Holdings: {len(holdings)} stocks\n"
-                f"Total Investment: ₹{total_investment:,.2f}\n"
-                f"Current Value: ₹{total_value:,.2f}\n"
-                f"Total P&L: ₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)\n"
+                "COMPLETE PORTFOLIO OVERVIEW:\n"
                 "\n"
-                "DETAILED HOLDINGS:\n"
-                f"{holdings_breakdown}\n"
+                "HOLDINGS (Long-term investments):\n"
+                f"Count: {len(holdings)} stocks\n"
+                f"Investment: Rs.{holdings_investment:,.2f}\n"
+                f"Current Value: Rs.{holdings_value:,.2f}\n"
+                f"P&L: Rs.{holdings_value - holdings_investment:,.2f}\n"
+                "\n"
+            )
+            
+            if holdings_text_parts:
+                portfolio_summary += "Holdings Detail:\n" + "\n".join(holdings_text_parts) + "\n\n"
+            
+            portfolio_summary += (
+                "POSITIONS (Active trades):\n"
+                f"Count: {len(positions)} trades\n"
+                f"Investment: Rs.{positions_investment:,.2f}\n"
+                f"Current Value: Rs.{positions_value:,.2f}\n"
+                f"P&L: Rs.{positions_value - positions_investment:,.2f}\n"
+                "\n"
+            )
+            
+            if positions_text_parts:
+                portfolio_summary += "Positions Detail:\n" + "\n".join(positions_text_parts) + "\n\n"
+            
+            portfolio_summary += (
+                "TOTAL PORTFOLIO:\n"
+                f"Total Investment: Rs.{total_investment:,.2f}\n"
+                f"Total Current Value: Rs.{total_value:,.2f}\n"
+                f"Total P&L: Rs.{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)\n"
                 "\n"
                 f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
             )
             
-            # Generate embedding and store
+            # Generate embedding
             portfolio_vector = embed_text(portfolio_summary)
 
             await upsert_embedding(
@@ -258,6 +261,7 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
                     "totalValue": total_value,
                     "totalPnL": total_pnl,
                     "holdingsCount": len(holdings),
+                    "positionsCount": len(positions),
                     "generatedAt": datetime.now(timezone.utc).isoformat()
                 }
             )
@@ -266,10 +270,9 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
             print(f"✅ Created portfolio summary embedding")
         
         # ============================================
-        # 2. TRADE HISTORY EMBEDDINGS (NEW!)
+        # 2. TRADE HISTORY EMBEDDINGS
         # ============================================
         
-        # Get last 6 months of trades
         six_months_ago = datetime.now(timezone.utc) - timedelta(days=180)
         
         trades = await db["trades"].find({
@@ -280,40 +283,34 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
         if trades:
             print(f"📊 Found {len(trades)} trades in last 6 months")
             
-            # Group trades by month
             trades_by_month = defaultdict(list)
             
             for trade in trades:
                 ts = trade.get("ts")
                 if ts:
-                    month_key = ts.strftime("%Y-%m")  # "2024-09"
+                    month_key = ts.strftime("%Y-%m")
                     trades_by_month[month_key].append(trade)
             
-            # Create embeddings for each month
             for month, month_trades in trades_by_month.items():
-                # Separate buys and sells
                 buy_trades = []
                 sell_trades = []
                 
                 for t in month_trades:
-                    # Check side field (might be in different formats)
                     side = str(t.get("side", "")).upper()
                     if "BUY" in side:
                         buy_trades.append(t)
                     elif "SELL" in side:
                         sell_trades.append(t)
                 
-                # Calculate totals
                 buy_value = sum(t.get("qty", 0) * t.get("price", 0) for t in buy_trades)
                 sell_value = sum(t.get("qty", 0) * t.get("price", 0) for t in sell_trades)
                 
-                # Build detailed summary
                 trade_summary_lines = [
                     f"TRADE ACTIVITY FOR {month}:",
                     f"Total Trades: {len(month_trades)}",
-                    f"Buys: {len(buy_trades)} trades worth ₹{buy_value:,.0f}",
-                    f"Sells: {len(sell_trades)} trades worth ₹{sell_value:,.0f}",
-                    f"Net Cash Flow: ₹{sell_value - buy_value:,.0f}",
+                    f"Buys: {len(buy_trades)} trades worth Rs.{buy_value:,.0f}",
+                    f"Sells: {len(sell_trades)} trades worth Rs.{sell_value:,.0f}",
+                    f"Net Cash Flow: Rs.{sell_value - buy_value:,.0f}",
                     ""
                 ]
                 
@@ -326,7 +323,7 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
                         ts = t.get("ts")
                         date_str = ts.strftime("%Y-%m-%d") if ts else "Unknown"
                         trade_summary_lines.append(
-                            f"  {date_str}: Bought {qty} shares of {sym} @ ₹{price:.2f} = ₹{qty*price:,.0f}"
+                            f"  {date_str}: Bought {qty} shares of {sym} @ Rs.{price:.2f}"
                         )
                 
                 if sell_trades:
@@ -338,19 +335,17 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
                         ts = t.get("ts")
                         date_str = ts.strftime("%Y-%m-%d") if ts else "Unknown"
                         trade_summary_lines.append(
-                            f"  {date_str}: Sold {qty} shares of {sym} @ ₹{price:.2f} = ₹{qty*price:,.0f}"
+                            f"  {date_str}: Sold {qty} shares of {sym} @ Rs.{price:.2f}"
                         )
                 
-                trade_summary_lines.append(f"\n[Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}]")
                 trade_summary = "\n".join(trade_summary_lines)
                 
-                # Generate embedding
                 trade_vector = embed_text(trade_summary)
                 
                 await upsert_embedding(
                     db,
                     user_id=user_id,
-                    kind="trade_history",  # New kind for trade history!
+                    kind="trade_history",
                     doc_id=f"trades-{month}",
                     vector=trade_vector,
                     chunk=trade_summary,
@@ -359,19 +354,17 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
                         "tradesCount": len(month_trades),
                         "buyCount": len(buy_trades),
                         "sellCount": len(sell_trades),
-                        "buyValue": buy_value,
-                        "sellValue": sell_value,
                         "generatedAt": datetime.now(timezone.utc).isoformat()
                     }
                 )
                 
                 embeddings_created += 1
-                print(f"✅ Created trade history embedding for {month}: {len(month_trades)} trades")
+                print(f"✅ Created trade history embedding for {month}")
         else:
             print("⚠️ No trades found in last 6 months")
         
         # ============================================
-        # 3. FUNDS SUMMARY EMBEDDING
+        # 3. FUNDS SUMMARY
         # ============================================
         
         funds = await db["funds"].find({"userId": user_id}).to_list(None)
@@ -381,24 +374,13 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
             for f in funds:
                 segment = f.get("segment", "EQUITY")
                 available = f.get("available", 0)
-
                 if isinstance(available, dict):
                     available = available.get("cash", 0)
                 net = f.get("net", 0)
                 
-                funds_parts.append(
-                    f"{segment}: Available ₹{available:,.2f}, Net ₹{net:,.2f}"
-                )
+                funds_parts.append(f"{segment}: Available Rs.{available:,.2f}, Net Rs.{net:,.2f}")
             
-            funds_breakdown = "\n".join(funds_parts)
-
-            funds_summary = (
-                "ACCOUNT FUNDS:\n"
-                f"{funds_breakdown}\n"
-                "\n"
-                f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-            )
-            
+            funds_summary = "ACCOUNT FUNDS:\n" + "\n".join(funds_parts)
             funds_vector = embed_text(funds_summary)
 
             await upsert_embedding(
@@ -408,94 +390,28 @@ async def build_embeddings_for_user(db: AsyncIOMotorDatabase, user_id: ObjectId)
                 doc_id=f"funds-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
                 vector=funds_vector,
                 chunk=funds_summary,
-                metadata={
-                    "generatedAt": datetime.now(timezone.utc).isoformat()
-                }
+                metadata={"generatedAt": datetime.now(timezone.utc).isoformat()}
             )
             
             embeddings_created += 1
             print(f"✅ Created funds summary embedding")
         
-        # ============================================
-        # 4. POSITIONS SUMMARY (Current Day Trading)
-        # ============================================
-        
-        positions = await db["positions"].find({"userId": user_id}).to_list(None)
-        
-        if positions:
-            positions_parts = []
-            total_day_pnl = 0
-            
-            for p in positions:
-                symbol = p.get("tradingsymbol", "UNKNOWN")
-                bucket = p.get("bucket", "net")
-                qty = p.get("qty", 0)
-                pnl = p.get("pnl", 0)
-                
-                if bucket == "day":
-                    total_day_pnl += pnl
-                    positions_parts.append(
-                        f"{symbol}: {qty} qty, Day P&L: ₹{pnl:,.2f}"
-                    )
-            
-            if positions_parts:
-                positions_breakdown = "\n".join(positions_parts)
-
-                positions_summary = (
-                    "CURRENT DAY POSITIONS:\n"
-                    f"Total Day P&L: ₹{total_day_pnl:,.2f}\n"
-                    "\n"
-                    "Active Positions:\n"
-                    f"{positions_breakdown}\n"
-                    "\n"
-                    f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-                )
-
-                
-                positions_vector = embed_text(positions_summary)
-
-                await upsert_embedding(
-                    db,
-                    user_id=user_id,
-                    kind="positions_summary",
-                    doc_id=f"positions-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-                    vector=positions_vector,
-                    chunk=positions_summary,
-                    metadata={
-                        "dayPnL": total_day_pnl,
-                        "positionsCount": len(positions_parts),
-                        "generatedAt": datetime.now(timezone.utc).isoformat()
-                    }
-                )
-                
-                embeddings_created += 1
-                print(f"✅ Created positions summary embedding")
-        
     except Exception as e:
         error_detail = traceback.format_exc()
         errors.append(str(e))
-        print(f"[Embeddings] FULL ERROR for user {user_id}:")
+        print(f"[Embeddings] ERROR for user {user_id}:")
         print(error_detail)
     
     return {
         "userId": str(user_id),
         "embeddingsCreated": embeddings_created,
         "errors": errors,
-        "status": "success" if embeddings_created > 0 else "no_data",
-        "breakdown": {
-            "portfolio": 1 if holdings else 0,
-            "tradeHistory": len(trades_by_month) if 'trades_by_month' in locals() else 0,
-            "funds": 1 if funds else 0,
-            "positions": 1 if positions and positions_parts else 0
-        }
+        "status": "success" if embeddings_created > 0 else "no_data"
     }
 
 
 async def list_active_users(db: AsyncIOMotorDatabase) -> List[ObjectId]:
-    """
-    Get list of all users with active Zerodha connections.
-    Used by scheduler to sync all users periodically.
-    """
+    """Get list of all users with active Zerodha connections."""
     cursor = db["connections"].find(
         {"provider": "zerodha", "enabled": True},
         {"userId": 1}

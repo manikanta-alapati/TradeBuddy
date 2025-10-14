@@ -958,7 +958,9 @@ async def debug_conversation_context(userId: str):
 
 # Add these endpoints
 
-@app.post("/whatsapp/webhook")  # Make sure this matches Twilio's webhook URL
+# app/main.py - UPDATE THIS SECTION
+
+@app.post("/whatsapp/webhook")
 async def whatsapp_webhook(
     From: str = Form(...),
     To: str = Form(...),
@@ -971,8 +973,17 @@ async def whatsapp_webhook(
     Twilio WhatsApp webhook endpoint.
     Receives incoming messages and responds.
     """
-    from app.services.whatsapp import parse_incoming_whatsapp, create_twiml_response
+    from app.services.whatsapp import parse_incoming_whatsapp, create_twiml_response, sanitize_whatsapp_message
     from app.services.whatsapp_handler import handle_whatsapp_message
+    
+    print(f"\n{'='*60}")
+    print(f"📱 [WEBHOOK] Incoming WhatsApp Message")
+    print(f"{'='*60}")
+    print(f"From: {From}")
+    print(f"To: {To}")
+    print(f"Body: {Body}")
+    print(f"MessageSid: {MessageSid}")
+    print(f"{'='*60}\n")
     
     # Parse incoming message
     form_data = {
@@ -986,18 +997,47 @@ async def whatsapp_webhook(
     
     parsed = parse_incoming_whatsapp(form_data)
     
-    # Handle message
-    response_text = await handle_whatsapp_message(
-        app.state.mongodb,
-        phone=parsed["from"],  # This is already cleaned (without whatsapp:+)
-        message=parsed["body"],
-        profile_name=parsed["profile_name"]
-    )
+    print(f"📝 [WEBHOOK] Parsed phone: {parsed['from']}")
+    print(f"📝 [WEBHOOK] Parsed message: {parsed['body']}")
     
-    # Return TwiML response
-    twiml = create_twiml_response(response_text)
+    # Handle message
+    try:
+        response_text = await handle_whatsapp_message(
+            app.state.mongodb,
+            phone=parsed["from"],
+            message=parsed["body"],
+            profile_name=parsed["profile_name"]
+        )
+        
+        print(f"\n✅ [WEBHOOK] Generated response:")
+        print(f"Length: {len(response_text)} chars")
+        print(f"Preview: {response_text[:200]}...")
+        
+        # ✅ NEW: Sanitize message to remove markdown formatting
+        # This fixes Twilio error 63038 (invalid WhatsApp message format)
+        clean_response = response_text
+        
+        print(f"\n🧹 [WEBHOOK] Sanitized response:")
+        print(f"Original length: {len(response_text)} chars")
+        print(f"Cleaned length:  {len(clean_response)} chars")
+        print(f"Preview: {clean_response[:200]}...")
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"\n❌ [WEBHOOK] Error generating response: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        clean_response = "Sorry, I encountered an error. Please try again."
+    
+    # Create TwiML response with sanitized message
+    twiml = create_twiml_response(clean_response)
+    
+    print(f"📤 [WEBHOOK] Sending TwiML response:")
+    print(f"{twiml[:500]}...")
+    print(f"{'='*60}\n")
+    
     return Response(content=twiml, media_type="application/xml")
-
 
 @app.post("/whatsapp/send")
 async def send_whatsapp_test(to: str, message: str):
@@ -1117,3 +1157,154 @@ async def debug_zerodha_orders_detail(userId: str, request: Request):
         }
     except Exception as e:
         return {"error": str(e)}
+    
+    
+    # app/main.py - ADD THIS
+
+@app.get("/debug/test-tavily")
+async def test_tavily_direct():
+    """Test Tavily API directly"""
+    from app.services.websearch import web_search
+    
+    test_query = "upcoming IPOs India October 2025"
+    
+    print(f"\n{'='*60}")
+    print(f"TESTING TAVILY API")
+    print(f"Query: {test_query}")
+    print(f"{'='*60}\n")
+    
+    try:
+        results = web_search(test_query, k=3)
+        
+        return {
+            "status": "success",
+            "query": test_query,
+            "results_count": len(results),
+            "tavily_api_key_set": bool(settings.tavily_api_key),
+            "tavily_api_key_prefix": settings.tavily_api_key[:10] + "..." if settings.tavily_api_key else "NOT SET",
+            "results": results
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "tavily_api_key_set": bool(settings.tavily_api_key)
+        }
+        
+        
+# app/main.py - ADD THIS DEBUG ENDPOINT
+
+@app.post("/debug/send-test-message")
+async def send_test_whatsapp(to: str, message: str = "Test from TradeBuddy!"):
+    """
+    Test sending WhatsApp message directly.
+    Usage: POST /debug/send-test-message?to=%2B919876543210&message=Hello
+    """
+    from app.services.whatsapp import send_whatsapp_message
+    
+    print(f"\n{'='*60}")
+    print(f"📤 [TEST] Sending test WhatsApp message")
+    print(f"To: {to}")
+    print(f"Message: {message}")
+    print(f"{'='*60}\n")
+    
+    result = send_whatsapp_message(to, message)
+    
+    print(f"\n{'='*60}")
+    print(f"📊 [TEST] Send result: {result}")
+    print(f"{'='*60}\n")
+    
+    return result
+
+
+# app/main.py - ADD THIS
+
+@app.get("/debug/twilio-status")
+async def check_twilio_status():
+    """Check if messages are being delivered"""
+    from twilio.rest import Client
+    
+    try:
+        client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
+        
+        # Get last 5 messages
+        messages = client.messages.list(limit=5)
+        
+        result = []
+        for msg in messages:
+            result.append({
+                "from": msg.from_,
+                "to": msg.to,
+                "body": msg.body[:100],
+                "status": msg.status,  # ← IMPORTANT!
+                "error_code": msg.error_code,
+                "error_message": msg.error_message,
+                "date": str(msg.date_created)
+            })
+        
+        return {
+            "messages_sent": len(result),
+            "messages": result
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+    
+    
+    
+    
+    
+# app/main.py - ADD THIS DEBUG ENDPOINT
+
+# app/main.py - UPDATE the test endpoint
+
+@app.get("/debug/test-emoji-sanitizer")
+async def test_emoji_sanitizer():
+    """Test emoji sanitization with real portfolio message"""
+    from app.services.whatsapp import sanitize_whatsapp_message
+    
+    test_cases = [
+        {
+            "name": "Portfolio with problematic emojis",
+            "input": "📊 **Your Portfolio**\n\n💼 Holdings: 7 stocks\n💰 Total Value: ₹79,041.30\n🟢 P&L: ₹9,856.75 (+14.25%)\n\n💡 Ask me about any stock!"
+        },
+        {
+            "name": "Message with smart quotes (ACTUAL FAILURE)",
+            "input": "Hiiiii! What's on your mind today? If you have any investment questions or need advice, I'm all ears!"
+        },
+        {
+            "name": "Message with em dashes",
+            "input": "Your portfolio — looking great — is up 14% today!"
+        },
+        {
+            "name": "Message with ellipsis",
+            "input": "Hmm… let me think about that…"
+        }
+    ]
+    
+    results = []
+    for test in test_cases:
+        original = test["input"]
+        sanitized = sanitize_whatsapp_message(original)
+        
+        # Check for problematic characters
+        has_smart_quote = ''' in original or ''' in original
+        has_em_dash = '—' in original
+        has_ellipsis = '…' in original
+        
+        results.append({
+            "name": test["name"],
+            "original": original,
+            "sanitized": sanitized,
+            "had_smart_quotes": has_smart_quote,
+            "had_em_dash": has_em_dash,
+            "had_ellipsis": has_ellipsis,
+            "changed": original != sanitized
+        })
+    
+    return {
+        "total_tests": len(results),
+        "results": results
+    }

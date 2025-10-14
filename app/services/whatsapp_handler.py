@@ -1,13 +1,8 @@
-# app/services/whatsapp_handler.py
-"""
-WhatsApp handler with TradeChat-style login flow.
-Matches the old working project exactly.
-"""
+# app/services/whatsapp_handler.py - COMPLETE FIX
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from bson import ObjectId
 from typing import Dict, Any
-import re
 
 from app.services.user_management import get_or_create_user, update_user_preference
 from app.services.retrieval import retrieve_context
@@ -18,9 +13,10 @@ from app.services.conversation import (
     format_conversation_for_llm,
     start_new_session
 )
-from app.services.websearch import web_search
 from app.settings import settings
 
+
+# app/services/whatsapp_handler.py - UPDATE
 
 async def handle_whatsapp_message(
     db: AsyncIOMotorDatabase,
@@ -28,97 +24,238 @@ async def handle_whatsapp_message(
     message: str,
     profile_name: str = "User"
 ) -> str:
-    """
-    Main handler for incoming WhatsApp messages.
-    Replicates TradeChat flow exactly.
+    """Main handler - FIXED VERSION"""
     
-    Args:
-        db: MongoDB database
-        phone: User's phone number (format: 919876543210)
-        message: Message text
-        profile_name: User's WhatsApp profile name
-    
-    Returns:
-        Response message to send back
-    """
-    # Get or create user (phone is the key)
     user = await get_or_create_user(db, phone)
     user_id = user["_id"]
     
-    # Normalize message
     msg_lower = message.lower().strip()
     
+    print(f"🔍 [HANDLER] Processing: '{message}' (normalized: '{msg_lower}')")
+    
+    # Get connection status
+    conn = await db["connections"].find_one({
+        "userId": user_id,
+        "provider": "zerodha",
+        "enabled": True
+    })
+    
     # ============================================
-    # AUTHENTICATION FLOW (TradeChat Style)
+    # PRIORITY 1: ALL COMMANDS
     # ============================================
     
-    # LOGIN COMMAND - Send Zerodha URL
+    # LOGIN
     if msg_lower in ["login", "connect", "link"]:
+        print(f"✅ [HANDLER] Matched LOGIN command")
         return await handle_login_command(phone)
     
-    # DONE COMMAND - Complete authentication
+    # DONE
     if msg_lower == "done":
+        print(f"✅ [HANDLER] Matched DONE command")
         return await handle_done_command(db, phone, user_id)
     
-    # ============================================
-    # QUICK COMMANDS
-    # ============================================
-    
-    if msg_lower in ["help", "/help", "?", "commands"]:
-        return get_help_message(user)
-    
+    # PORTFOLIO
     if msg_lower in ["portfolio", "p", "holdings"]:
+        print(f"📈 [HANDLER] Matched PORTFOLIO command")
+        if not conn:
+            return "You haven't connected your Zerodha account yet!\n\nType \"login\" to get started."
         return await get_quick_portfolio(db, user_id, phone)
     
+    # PNL
     if msg_lower in ["pnl", "profit", "loss"]:
+        print(f"💰 [HANDLER] Matched PNL command")
+        if not conn:
+            return "You haven't connected your Zerodha account yet!\n\nType \"login\" to get started."
         return await get_quick_pnl(db, user_id, phone)
     
+    # HELP
+    if msg_lower in ["help", "/help", "?", "commands", "start"]:
+        print(f"✅ [HANDLER] Matched HELP command")
+        return get_help_message(user, conn is not None)
+    
+    # MODES
+    if msg_lower in ["modes", "personas", "personalities", "styles"]:
+        print(f"✅ [HANDLER] Matched MODES command")
+        return get_personas_message()
+    
+    # STATUS
     if msg_lower in ["status", "connected", "account"]:
+        print(f"✅ [HANDLER] Matched STATUS command")
         return await check_connection_status(db, user_id)
     
-    # MODE SWITCHING
-    if msg_lower.startswith("/mode ") or msg_lower in ["savage", "friendly", "professional", "funny"]:
+    # SWITCH MODE
+    if msg_lower in ["savage", "friendly", "professional", "funny"]:
+        print(f"✅ [HANDLER] Matched MODE SWITCH command")
         return await handle_mode_switch(db, phone, msg_lower)
     
     # NEW SESSION
-    if msg_lower in ["new session", "/new", "fresh start", "reset"]:
+    if msg_lower in ["new session", "/new", "fresh start", "reset chat"]:
+        print(f"✅ [HANDLER] Matched NEW SESSION command")
         result = await start_new_session(db, user_id)
         return result["message"]
     
+    # REFRESH (manual sync
+    if msg_lower in ["refresh", "sync", "update"]:
+        print(f"🔄 [HANDLER] Matched REFRESH command")
+        if not conn:
+            return "You haven't connected your Zerodha account yet!\n\nType \"login\" to get started."
+        return await handle_refresh_command(db, user_id)
+    
+          
+    
     # ============================================
-    # PORTFOLIO QUESTIONS (RAG)
+    # PRIORITY 2: REGULAR QUESTIONS
     # ============================================
     
+    # Check if user needs to connect first
+    if not conn:
+        portfolio_keywords = ['portfolio', 'holdings', 'stocks', 'pnl', 'profit', 'loss', 'tatacap', 'tcs', 'reliance']
+        if any(keyword in msg_lower for keyword in portfolio_keywords):
+            # Check if first time user (no messages yet)
+            message_count = await db["messages"].count_documents({"userId": user_id})
+            if message_count == 0:
+                print(f"👋 [HANDLER] First message from unconnected user - showing welcome")
+                return get_welcome_message(profile_name)
+            else:
+                return "Please connect your Zerodha account first.\n\nType \"login\" to get started."
+    
+    # Process as regular question (this will save the message!)
+    print(f"💬 [HANDLER] Processing as regular question")
     return await handle_question(db, user_id, phone, message)
 
 
 # ============================================
-# AUTHENTICATION HANDLERS (TradeChat Flow)
+# WELCOME & INFO MESSAGES
+# ============================================
+
+def get_welcome_message(profile_name: str) -> str:
+    """Welcome message for first-time users."""
+    return f"""Hey {profile_name}! Welcome to TradeBuddy!
+
+I'm your AI-powered personal financial advisor. I can help you:
+
+- Check your portfolio anytime
+- Track P&L and performance
+- Get stock recommendations
+- Search latest market news
+- Answer investment questions
+
+HOW TO GET STARTED:
+
+Step 1: Connect Your Zerodha Account
+Type: login
+
+I'll send you a secure link to connect. Your credentials are never stored!
+
+Step 2: Choose Your Style
+I have 4 personalities:
+- Friendly (casual & warm)
+- Professional (formal analysis)
+- Savage (brutally honest)
+- Funny (memes & humor)
+
+Type "modes" to learn more!
+
+Step 3: Start Chatting
+Once connected, just ask me anything:
+- "What's my portfolio?"
+- "Should I buy TCS?"
+- "Latest tech stock news?"
+
+Ready to connect? Type: login"""
+
+
+def get_personas_message() -> str:
+    """Explain the 4 personality modes."""
+    return """Choose Your TradeBuddy Personality:
+
+1. FRIENDLY (Default)
+Casual, warm, and conversational
+Perfect for everyday questions
+
+2. PROFESSIONAL
+Formal, analytical, data-driven
+Best for serious analysis
+
+3. SAVAGE
+Brutally honest, no sugarcoating
+For traders who want the hard truth
+
+4. FUNNY
+Memes, jokes, casual vibes
+Make investing fun
+
+TO SWITCH MODES:
+Type: friendly
+Type: professional
+Type: savage
+Type: funny
+
+Current questions? Just ask away!"""
+
+
+def get_help_message(user: dict, has_connection: bool) -> str:
+    """Help message - different based on connection status."""
+    if has_connection:
+        current_mode = user.get("preferences", {}).get("personalityMode", "friendly")
+        
+        return f"""TradeBuddy Help
+
+QUICK COMMANDS:
+- portfolio - View your holdings
+- pnl - Check profit/loss
+- status - Check connection
+- modes - Change personality
+
+PERSONALITY MODES:
+Current: {current_mode.title()}
+Switch: Type mode name
+
+NATURAL QUESTIONS:
+Just ask naturally!
+
+NEW SESSION:
+- Type: new session
+
+Need help? Just ask!"""
+    
+    else:
+        return """TradeBuddy Help
+
+You haven't connected your Zerodha account yet!
+
+TO GET STARTED:
+1. Type: login
+2. Connect Zerodha (secure)
+3. Type: done
+4. Start asking!
+
+Ready? Type: login"""
+
+
+# ============================================
+# AUTHENTICATION HANDLERS
 # ============================================
 
 async def handle_login_command(phone: str) -> str:
-    """
-    Generate Zerodha login URL and send to user.
-    Uses simple phone number as state (like old project).
-    """
-    # Generate Zerodha login URL with phone as state
+    """Generate Zerodha login URL."""
     zerodha_url = (
         f"https://kite.zerodha.com/connect/login?"
         f"v=3&"
         f"api_key={settings.kite_api_key}&"
-        f"state={phone}"  # Simple phone number, not encoded
+        f"state={phone}"
     )
     
-    return f"""🔐 **Connect Your Zerodha Account**
+    return f"""Connect Your Zerodha Account
 
 Click here to login: {zerodha_url}
 
 After login:
 1. Complete 2FA on Zerodha
 2. You'll see a success page
-3. Come back here and type *"done"*
+3. Come back here and type "done"
 
-🔒 Your credentials are secure and never stored."""
+Your credentials are secure and never stored."""
 
 
 async def handle_done_command(
@@ -126,10 +263,7 @@ async def handle_done_command(
     phone: str,
     user_id: ObjectId
 ) -> str:
-    """
-    Complete authentication after user logs in.
-    Claims any recent unused token (since Zerodha doesn't pass phone reliably).
-    """
+    """Complete authentication after user logs in."""
     from app.services.kite_client import exchange_request_token_for_access_token
     import datetime as dt
     from datetime import timezone
@@ -140,8 +274,7 @@ async def handle_done_command(
     
     print(f"🔍 Looking for tokens. Total: {len(temp_tokens)}")
     
-    # Find the most recent unused token (within 5 minutes)
-    # Don't check phone since callback stores it as None
+    # Find the most recent unused token
     request_token = None
     newest_timestamp = 0
     
@@ -150,35 +283,21 @@ async def handle_done_command(
         age = dt.datetime.now(timezone.utc).timestamp() - token_time
         is_used = data.get('used', False)
         
-        print(f"  Token: {token[:20]}... | Used: {is_used} | Age: {age:.0f}s")
-        
-        if (not is_used and 
-            age < 300 and  # Less than 5 minutes old
-            token_time > newest_timestamp):
-            # Found a newer unused token
+        if (not is_used and age < 300 and token_time > newest_timestamp):
             request_token = token
             newest_timestamp = token_time
     
     if not request_token:
-        print(f"❌ No valid token found")
-        return """❌ No recent login found.
+        return """No recent login found.
 
-Please type *"login"* and try again.
-
-Make sure you:
-1. Click the login link
-2. Complete Zerodha login
-3. Come back within 5 minutes
-4. Type "done" """
+Please type "login" and try again."""
     
-    # Mark token as used and associate with this phone
+    # Mark token as used
     temp_tokens[request_token]['used'] = True
     temp_tokens[request_token]['phone'] = phone
     
-    print(f"✅ Claiming token: {request_token[:20]}... for phone: {phone}")
-    
     try:
-        # Exchange request token for access token
+        # Exchange token
         tokens = exchange_request_token_for_access_token(request_token)
         
         # Save to database
@@ -198,46 +317,24 @@ Make sure you:
             upsert=True
         )
         
-        print(f"✅ Connected Zerodha for user {user_id}")
-        
-        # ============================================
-        # TRIGGER IMMEDIATE SYNC AFTER LOGIN
-        # ============================================
-        
+        # Trigger sync
         try:
             from app.services.sync import run_incremental_sync, build_embeddings_for_user
             
-            print(f"🔄 Starting portfolio sync...")
+            await run_incremental_sync(db, user_id, force_instruments=False, skip_embeddings=True)
+            await build_embeddings_for_user(db, user_id)
             
-            # Sync portfolio data
-            sync_result = await run_incremental_sync(
-                db, 
-                user_id,
-                force_instruments=False,
-                skip_embeddings=True
-            )
-            
-            print(f"✅ Sync result: {sync_result}")
-            
-            # Generate embeddings
-            print(f"🧠 Generating embeddings...")
-            embeddings_result = await build_embeddings_for_user(db, user_id)
-            
-            print(f"✅ Embeddings: {embeddings_result}")
-            
-            # Success message with count
             holdings_count = await db["holdings"].count_documents({"userId": user_id})
             
-            return f"""✅ **Successfully Connected!**
+            return f"""Successfully Connected!
 
-🎉 Your Zerodha account is linked!
+Your Zerodha account is linked!
 
-📊 **Synced:**
+Synced:
 - {holdings_count} holdings
 - Portfolio data ready
-- Embeddings generated
 
-**Try:**
+Try:
 - "portfolio"
 - "pnl"
 - "How is my portfolio doing?"
@@ -245,214 +342,113 @@ Make sure you:
 What would you like to know?"""
         
         except Exception as sync_error:
-            print(f"⚠️ Sync error: {sync_error}")
-            import traceback
-            traceback.print_exc()
-            
-            return """✅ **Successfully Connected!**
+            return """Successfully Connected!
 
-⚠️ Portfolio sync in progress...
+Portfolio sync in progress...
 
 Wait 30 seconds, then try:
 - "portfolio"
-- "pnl"
-
-Or ask any question!"""
+- "pnl" """
         
     except Exception as e:
-        print(f"❌ Auth error: {e}")
-        import traceback
-        traceback.print_exc()
-        return f"""❌ Authentication failed: {str(e)}
+        return f"""Authentication failed: {str(e)}
 
-Please type *"login"* to try again."""
+Please type "login" to try again."""
+
 
 # ============================================
-# PORTFOLIO QUERY HANDLERS
+# PORTFOLIO COMMANDS
 # ============================================
 
-async def handle_question(
-    db: AsyncIOMotorDatabase,
-    user_id: ObjectId,
-    phone: str,
-    question: str
-) -> str:
-    """
-    Handle a regular question using RAG.
-    Checks authentication first.
-    """
-    # Get user data for preferences
-    user = await db["users"].find_one({"_id": user_id})
-    
-    # Check if user has Zerodha connection
-    conn = await db["connections"].find_one({
-        "userId": user_id,
-        "provider": "zerodha",
-        "enabled": True
-    })
-    
-    if not conn:
-        # Check if question is portfolio-related
-        portfolio_keywords = [
-            'portfolio', 'holdings', 'stocks', 'pnl', 'profit', 'loss',
-            'performance', 'investment', 'value', 'cash', 'margin', 'trades'
-        ]
-        
-        if any(keyword in question.lower() for keyword in portfolio_keywords):
-            return """🔐 Please connect your Zerodha account first.
-
-Type *"login"* to get started."""
-    
-    # Get conversation context
-    conversation_messages, context_type = await get_conversation_context(
-        db, user_id, max_tokens=16000
-    )
-    conversation_history = format_conversation_for_llm(conversation_messages)
-    
-    # Detect if question is about trade history
-    q_low = question.lower()
-    trade_keywords = [
-        "buy", "bought", "sell", "sold", "trade", "purchase", "purchased",
-        "september", "october", "november", "december", "january", "last month", 
-        "last week", "recent", "history", "past", "did i", "when did",
-        "sold any", "bought any"
-    ]
-    is_trade_query = any(kw in q_low for kw in trade_keywords)
-    
-    # Get portfolio context via vector search
-    chunks = await retrieve_context(
-        db,
-        user_id=user_id,
-        question=question,
-        k=5,
-        kind="portfolio_summary"
-    )
-    
-    # ALSO search trade history if relevant
-    if is_trade_query:
-        print(f"🔍 Searching trade history for: {question}")
-        trade_chunks = await retrieve_context(
-            db,
-            user_id=user_id,
-            question=question,
-            k=3,
-            kind="trade_history"  # Search trade history embeddings!
-        )
-        print(f"📊 Found {len(trade_chunks)} trade history chunks")
-        chunks = (chunks or []) + trade_chunks
-    
-    # Check if question needs web search
-    if any(term in q_low for term in ["news", "market", "today", "latest", "current"]):
-        web_query = question[7:].strip() if q_low.startswith("search:") else question
-        web_chunks = web_search(web_query, k=3)
-        for wc in web_chunks:
-            wc["docId"] = f"{wc['docId']} (web)"
-        chunks = (chunks or []) + web_chunks
-    
-    # Get user's personality mode (with fallback if user not found)
-    persona = user.get("preferences", {}).get("personalityMode", "friendly") if user else "friendly"
-    
-    # Generate answer
-    answer = answer_with_context(
-        question,
-        chunks,
-        persona=persona,
-        response_style="whatsapp",
-        conversation_history=conversation_history
-    )
-    
-    # Store conversation
-    result = await handle_message_with_context(db, user_id, question, answer)
-    
-    # Add milestone notification if triggered
-    if result.get("milestone"):
-        milestone_msg = result["milestone"]["message"]
-        answer = f"{answer}\n\n---\n{milestone_msg}"
-    
-    return answer
-
+# app/services/whatsapp_handler.py - UPDATE get_quick_portfolio
 
 async def get_quick_portfolio(
     db: AsyncIOMotorDatabase,
     user_id: ObjectId,
     phone: str
 ) -> str:
-    """Quick portfolio summary."""
-    conn = await db["connections"].find_one({
-        "userId": user_id,
-        "provider": "zerodha",
-        "enabled": True
-    })
+    """Quick portfolio summary - UPDATED with positions."""
     
-    if not conn:
-        return """🔐 Please login first.
-
-Type *"login"* to connect your Zerodha account."""
-    
-    # Get holdings from MongoDB
+    # Get holdings (long-term)
     holdings = await db["holdings"].find({"userId": user_id}).to_list(None)
     
-    if not holdings:
-        return """📊 No holdings found.
-
-Your portfolio might be empty, or data hasn't synced yet.
-
-Type *"refresh"* to sync your data."""
+    # Get positions (active trades)
+    positions = await db["positions"].find({"userId": user_id}).to_list(None)
     
-    # Calculate totals
-    total_value = 0
-    total_investment = 0
+    if not holdings and not positions:
+        return """No holdings or positions found.
+
+Your portfolio might be empty.
+
+Type "refresh" to sync latest data."""
+    
+    # Calculate holdings totals
+    holdings_value = 0
+    holdings_investment = 0
     
     for h in holdings:
         qty = h.get("qty", 0)
         avg_price = h.get("avgPrice", 0)
         last_price = h.get("lastPrice", 0)
         
-        total_investment += qty * avg_price
-        total_value += qty * last_price
+        holdings_investment += qty * avg_price
+        holdings_value += qty * last_price
     
+    # Calculate positions totals
+    positions_value = 0
+    positions_investment = 0
+    
+    for p in positions:
+        qty = p.get("quantity", 0)
+        avg_price = p.get("average_price", 0)
+        last_price = p.get("last_price", 0)
+        
+        positions_investment += qty * avg_price
+        positions_value += qty * last_price
+    
+    # Total P&L
+    total_investment = holdings_investment + positions_investment
+    total_value = holdings_value + positions_value
     total_pnl = total_value - total_investment
     pnl_pct = (total_pnl / total_investment * 100) if total_investment > 0 else 0
-    pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
     
-    response = f"""📊 **Your Portfolio**
+    response = f"""Your Portfolio
 
-💼 Holdings: {len(holdings)} stocks
-💰 Total Value: ₹{total_value:,.2f}
-{pnl_emoji} P&L: ₹{total_pnl:,.2f} ({pnl_pct:+.2f}%)
+HOLDINGS: {len(holdings)} stocks
+Value: Rs.{holdings_value:,.2f}
 
-💡 Ask me about any specific stock!"""
+POSITIONS: {len(positions)} trades
+Value: Rs.{positions_value:,.2f}
+
+TOTAL VALUE: Rs.{total_value:,.2f}
+P&L: Rs.{total_pnl:,.2f} ({pnl_pct:+.2f}%)
+
+Ask me about any stock or position!"""
     
     return response
 
+
+# app/services/whatsapp_handler.py - UPDATE get_quick_pnl
 
 async def get_quick_pnl(
     db: AsyncIOMotorDatabase,
     user_id: ObjectId,
     phone: str
 ) -> str:
-    """Quick P&L summary."""
-    conn = await db["connections"].find_one({
-        "userId": user_id,
-        "provider": "zerodha",
-        "enabled": True
-    })
-    
-    if not conn:
-        return """🔐 Please login first.
-
-Type *"login"* to connect your Zerodha account."""
+    """Quick P&L summary - UPDATED with positions."""
     
     # Get holdings
     holdings = await db["holdings"].find({"userId": user_id}).to_list(None)
     
-    if not holdings:
-        return "📊 No holdings found. Type *refresh* to sync."
+    # Get positions
+    positions = await db["positions"].find({"userId": user_id}).to_list(None)
     
-    # Calculate P&L
+    if not holdings and not positions:
+        return "No holdings or positions found."
+    
     stocks_pnl = []
-    total_pnl = 0
     
+    # Calculate P&L for holdings
     for h in holdings:
         symbol = h.get("tradingsymbol", "UNKNOWN")
         qty = h.get("qty", 0)
@@ -464,9 +460,28 @@ Type *"login"* to connect your Zerodha account."""
         pnl = current_value - investment
         pnl_pct = (pnl / investment * 100) if investment > 0 else 0
         
-        total_pnl += pnl
         stocks_pnl.append({
             "symbol": symbol,
+            "type": "HOLDING",
+            "pnl": pnl,
+            "pnl_pct": pnl_pct
+        })
+    
+    # Calculate P&L for positions
+    for p in positions:
+        symbol = p.get("tradingsymbol", "UNKNOWN")
+        qty = p.get("quantity", 0)
+        avg_price = p.get("average_price", 0)
+        last_price = p.get("last_price", 0)
+        
+        investment = qty * avg_price
+        current_value = qty * last_price
+        pnl = current_value - investment
+        pnl_pct = (pnl / investment * 100) if investment > 0 else 0
+        
+        stocks_pnl.append({
+            "symbol": symbol,
+            "type": "POSITION",
             "pnl": pnl,
             "pnl_pct": pnl_pct
         })
@@ -474,26 +489,29 @@ Type *"login"* to connect your Zerodha account."""
     # Sort by P&L
     stocks_pnl.sort(key=lambda x: x["pnl"], reverse=True)
     
-    top_gainers = [s for s in stocks_pnl if s["pnl"] > 0][:3]
-    top_losers = [s for s in stocks_pnl if s["pnl"] < 0][-3:]
+    # Calculate totals
+    total_pnl = sum(s["pnl"] for s in stocks_pnl)
     
-    pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+    top_gainers = [s for s in stocks_pnl if s["pnl"] > 0][:5]
+    top_losers = [s for s in stocks_pnl if s["pnl"] < 0][-5:]
     
-    response = f"""{pnl_emoji} **P&L Summary**
+    response = f"""P&L Summary
 
-Total P&L: ₹{total_pnl:,.2f}
+Total P&L: Rs.{total_pnl:,.2f}
 
 """
     
     if top_gainers:
-        response += "🚀 **Top Gainers:**\n"
+        response += "Top Gainers:\n"
         for s in top_gainers:
-            response += f"• {s['symbol']}: +₹{s['pnl']:,.2f} ({s['pnl_pct']:+.2f}%)\n"
+            response += f"- {s['symbol']} ({s['type']}): +Rs.{s['pnl']:,.2f} ({s['pnl_pct']:+.2f}%)\n"
     
     if top_losers:
-        response += "\n📉 **Underperformers:**\n"
+        response += "\nUnderperformers:\n"
         for s in top_losers:
-            response += f"• {s['symbol']}: ₹{s['pnl']:,.2f} ({s['pnl_pct']:+.2f}%)\n"
+            response += f"- {s['symbol']} ({s['type']}): Rs.{s['pnl']:,.2f} ({s['pnl_pct']:+.2f}%)\n"
+    
+    response += f"\nHoldings: {len(holdings)} | Positions: {len(positions)}"
     
     return response
 
@@ -507,26 +525,22 @@ async def check_connection_status(db: AsyncIOMotorDatabase, user_id: ObjectId) -
     })
     
     if not conn:
-        return """❌ **Not Connected**
+        return """Not Connected
 
 You haven't linked your Zerodha account yet.
 
-Type *"login"* to connect now!"""
+Type "login" to connect now!"""
     
-    return """✅ **Connected to Zerodha**
+    return """Connected to Zerodha
 
 Your account is linked and active!
 
 Available commands:
-• *portfolio* - View your holdings
-• *pnl* - Check profit/loss
+- portfolio - View holdings
+- pnl - Check profit/loss
 
 Or just ask me anything!"""
 
-
-# ============================================
-# MODE SWITCHING
-# ============================================
 
 async def handle_mode_switch(
     db: AsyncIOMotorDatabase,
@@ -534,72 +548,117 @@ async def handle_mode_switch(
     message: str
 ) -> str:
     """Handle personality mode switching."""
-    # Extract mode
-    mode = message.replace("/mode ", "").strip()
+    mode = message.strip()
     
     valid_modes = {
-        "savage": "💀 Savage mode activated. Prepare for brutal honesty.",
-        "friendly": "😊 Friendly mode activated! Let's chat casually.",
-        "professional": "📊 Professional mode activated. Formal analysis engaged.",
-        "funny": "🤣 Funny mode activated! Time for memes! 🚀"
+        "savage": "Savage mode activated. Prepare for brutal honesty.",
+        "friendly": "Friendly mode activated! Let's chat casually.",
+        "professional": "Professional mode activated. Formal analysis engaged.",
+        "funny": "Funny mode activated! Time for memes!"
     }
     
     if mode not in valid_modes:
-        return f"""Choose a mode:
-• *savage* - Brutally honest 💀
-• *friendly* - Casual & warm 😊  
-• *professional* - Formal analysis 📊
-• *funny* - Memes & humor 🤣
+        return """Choose a mode:
+- savage
+- friendly
+- professional
+- funny
 
-Example: Type "savage" or "/mode savage" """
+Type the mode name to switch."""
     
-    # Update user preference
     success = await update_user_preference(db, phone, "personalityMode", mode)
     
-    if success:
-        return valid_modes[mode]
-    else:
-        return "❌ Failed to switch mode. Try again."
+    return valid_modes[mode] if success else "Failed to switch mode. Try again."
 
 
 # ============================================
-# HELP MESSAGE
+# REGULAR QUESTIONS (RAG + LLM)
 # ============================================
 
-def get_help_message(user: Dict) -> str:
-    """Return help message with all commands."""
-    has_connection = user.get("zerodhaAuth", {}).get("isAuthenticated", False)
+async def handle_question(
+    db: AsyncIOMotorDatabase,
+    user_id: ObjectId,
+    phone: str,
+    question: str
+) -> str:
+    """Handle regular question using RAG."""
+    user = await db["users"].find_one({"_id": user_id})
     
-    if has_connection:
-        return """🤖 **TradeBuddy Commands**
-
-**Portfolio:**
-• `portfolio` - View holdings
-• `pnl` - Profit/loss summary
-• `status` - Connection status
-
-**Modes:**
-• `savage` - Brutally honest 💀
-• `friendly` - Casual 😊
-• `professional` - Formal 📊
-• `funny` - Memes 🤣
-
-**Natural Questions:**
-• "How's my portfolio?"
-• "Should I buy TCS?"
-• "Top gainers today?"
-
-Type any question naturally!"""
+    conn = await db["connections"].find_one({
+        "userId": user_id,
+        "provider": "zerodha",
+        "enabled": True
+    })
     
-    else:
-        return """🤖 **TradeBuddy Help**
+    if not conn:
+        portfolio_keywords = ['portfolio', 'holdings', 'stocks', 'pnl', 'profit', 'loss']
+        if any(keyword in question.lower() for keyword in portfolio_keywords):
+            return """Please connect your Zerodha account first.
 
-🔐 **First time?**
-Type *"login"* to connect your Zerodha account
+Type "login" to get started."""
+    
+    conversation_messages, _ = await get_conversation_context(db, user_id, max_tokens=16000)
+    conversation_history = format_conversation_for_llm(conversation_messages)
+    
+    chunks = await retrieve_context(db, user_id=user_id, question=question, k=5, kind="portfolio_summary")
+    
+    persona = user.get("preferences", {}).get("personalityMode", "friendly") if user else "friendly"
+    
+    answer = answer_with_context(
+        question,
+        chunks,
+        persona=persona,
+        response_style="whatsapp",
+        conversation_history=conversation_history
+    )
+    
+    await handle_message_with_context(db, user_id, question, answer)
+    
+    return answer
 
-**After connecting:**
-• View portfolio & P&L
-• Ask questions naturally
-• Get personalized advice
 
-Type *"login"* to get started!"""
+
+
+
+async def handle_refresh_command(
+    db: AsyncIOMotorDatabase,
+    user_id: ObjectId
+) -> str:
+    """Manually trigger portfolio sync."""
+    try:
+        from app.services.sync import run_incremental_sync, build_embeddings_for_user
+        
+        print(f"🔄 [REFRESH] Starting manual sync for user {user_id}")
+        
+        # Sync portfolio
+        await run_incremental_sync(
+            db,
+            user_id,
+            force_instruments=False,
+            skip_embeddings=True
+        )
+        
+        # Regenerate embeddings
+        await build_embeddings_for_user(db, user_id)
+        
+        holdings_count = await db["holdings"].count_documents({"userId": user_id})
+        
+        print(f"✅ [REFRESH] Sync complete: {holdings_count} holdings")
+        
+        return f"""Portfolio refreshed!
+
+Synced: {holdings_count} holdings
+Data updated: Just now
+
+Try: "portfolio" or "pnl"
+
+Your data is now up-to-date!"""
+        
+    except Exception as e:
+        print(f"❌ [REFRESH] Sync failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return f"""Refresh failed: {str(e)}
+
+Try again, or contact support if the issue persists."""
