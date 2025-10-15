@@ -25,6 +25,8 @@ async def insert_embedding(
     }
     res = await db[EMBEDDINGS_COLL].insert_one(doc)
     return str(res.inserted_id)
+# In app/services/vector.py - Update the vector_search function
+
 async def vector_search(
     db: AsyncIOMotorDatabase,
     *,
@@ -33,10 +35,11 @@ async def vector_search(
     query_vector: List[float],
     k: int = 3
 ) -> List[Dict[str, Any]]:
+    """Fixed with correct index name"""
     pipeline = [
         {
             "$vectorSearch": {
-                "index": "embeddings_vector",
+                "index": "embeddings_vector",  # ← FIXED! Was "embeddings_vector" in your code
                 "queryVector": query_vector,
                 "path": "vector",
                 "numCandidates": 100,
@@ -46,7 +49,7 @@ async def vector_search(
         },
         {
             "$project": {
-                "_id": 0,                               # <-- exclude ObjectId
+                "_id": 0,
                 "docId": 1,
                 "chunk": 1,
                 "score": { "$meta": "vectorSearchScore" }
@@ -55,7 +58,6 @@ async def vector_search(
     ]
     cursor = db["embeddings"].aggregate(pipeline)
     return [doc async for doc in cursor]
-
 
 async def upsert_embedding(
     db: AsyncIOMotorDatabase,

@@ -1308,3 +1308,142 @@ async def test_emoji_sanitizer():
         "total_tests": len(results),
         "results": results
     }
+    
+    
+    
+# Add this to app/main.py
+
+@app.get("/debug/check-embeddings")
+async def check_embeddings(userId: str, request: Request):
+    """Check if embeddings exist for user and diagnose issues."""
+    from bson import ObjectId
+    
+    db = request.app.state.mongodb
+    user_id = ObjectId(userId)
+    
+    # Check embeddings count
+    embeddings_count = await db["embeddings"].count_documents({"userId": user_id})
+    
+    # Get sample embeddings
+    sample_embeddings = await db["embeddings"].find(
+        {"userId": user_id},
+        {"kind": 1, "docId": 1, "chunk": 1, "vector": {"$slice": 5}}  # First 5 dims only
+    ).limit(3).to_list(3)
+    
+    # Check holdings
+    holdings_count = await db["holdings"].count_documents({"userId": user_id})
+    
+    # Check if vector field exists
+    vector_fields = set()
+    if embeddings_count > 0:
+        first_doc = await db["embeddings"].find_one({"userId": user_id})
+        vector_fields = {"vector" if "vector" in first_doc else None,
+                        "embedding" if "embedding" in first_doc else None}
+    
+    return {
+        "userId": userId,
+        "embeddingsCount": embeddings_count,
+        "holdingsCount": holdings_count,
+        "sampleEmbeddings": sample_embeddings,
+        "vectorFieldNames": list(vector_fields - {None}),
+        "diagnosis": {
+            "hasEmbeddings": embeddings_count > 0,
+            "hasHoldings": holdings_count > 0,
+            "probableIssue": "No embeddings generated" if embeddings_count == 0 
+                           else "Vector search index misconfigured" if embeddings_count > 0
+                           else "Unknown"
+        }
+    }
+
+@app.post("/debug/force-generate-embeddings")
+async def force_generate_embeddings(userId: str, request: Request):
+    """Force regenerate embeddings for a user."""
+    from app.services.sync import build_embeddings_for_user
+    from bson import ObjectId
+    
+    db = request.app.state.mongodb
+    user_id = ObjectId(userId)
+    
+    # Delete old embeddings
+    delete_result = await db["embeddings"].delete_many({"userId": user_id})
+    
+    # Generate new embeddings
+    result = await build_embeddings_for_user(db, user_id)
+    
+    return {
+        "deletedOld": delete_result.deleted_count,
+        "generationResult": result
+    }
+    
+    # Add this to app/main.py
+
+@app.get("/debug/compare-holdings")
+async def compare_holdings(userId: str, request: Request):
+    """Compare MongoDB data vs Live Zerodha data"""
+    from bson import ObjectId
+    from app.services.kite_client import build_kite_client
+    
+    db = request.app.state.mongodb
+    user_id = ObjectId(userId)
+    
+    # Get MongoDB stored data
+    mongo_holdings = await db["holdings"].find({"userId": user_id}).to_list(None)
+    
+    # Get Zerodha connection
+    conn = await db["connections"].find_one({
+        "userId": user_id, 
+        "provider": "zerodha"
+    })
+    
+    if not conn:
+        return {"error": "No Zerodha connection"}
+    
+    # Get LIVE Zerodha data
+    kite = build_kite_client(conn.get("accessToken"), conn.get("apiKey"))
+    
+    try:
+        live_holdings = kite.get_holdings()
+    except Exception as e:
+        return {"error": f"Zerodha API error: {str(e)}"}
+    
+    # Compare specific stocks
+    comparison = {}
+    
+    for holding in live_holdings:
+        symbol = holding.get("tradingsymbol")
+        if symbol in ["ASIANPAINT", "DIXON"]:
+            # Find MongoDB version
+            mongo_version = next(
+                (h for h in mongo_holdings if h.get("tradingsymbol") == symbol), 
+                None
+            )
+            
+            comparison[symbol] = {
+                "LIVE_ZERODHA": {
+                    "last_price": holding.get("last_price"),
+                    "average_price": holding.get("average_price"),
+                    "quantity": holding.get("quantity"),
+                    "pnl": holding.get("pnl"),
+                    "day_change": holding.get("day_change"),
+                    "day_change_percentage": holding.get("day_change_percentage")
+                },
+                "MONGODB_STORED": {
+                    "lastPrice": mongo_version.get("lastPrice") if mongo_version else None,
+                    "avgPrice": mongo_version.get("avgPrice") if mongo_version else None,
+                    "qty": mongo_version.get("qty") if mongo_version else None,
+                    "updatedAt": str(mongo_version.get("updatedAt")) if mongo_version else None
+                } if mongo_version else "NOT FOUND"
+            }
+    
+    # Check last sync time
+    last_sync = await db["holdings"].find_one(
+        {"userId": user_id},
+        sort=[("updatedAt", -1)]
+    )
+    
+    return {
+        "comparison": comparison,
+        "lastSyncTime": str(last_sync.get("updatedAt")) if last_sync else None,
+        "totalMongoHoldings": len(mongo_holdings),
+        "totalLiveHoldings": len(live_holdings)
+    }
