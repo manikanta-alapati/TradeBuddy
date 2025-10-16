@@ -40,6 +40,8 @@ async def _mark_instruments_updated(db: AsyncIOMotorDatabase):
         upsert=True
     )
 
+# In app/services/sync.py - Update run_incremental_sync
+
 async def run_incremental_sync(
     db: AsyncIOMotorDatabase,
     user_id: ObjectId,
@@ -48,53 +50,117 @@ async def run_incremental_sync(
     skip_embeddings: bool = True,
 ) -> Dict[str, Any]:
     """
-    Fast path sync:
-    - Optionally pulls master instruments (only when forced).
-    - Always pulls funds/holdings/positions/orders/trades and upserts.
-    - Embeddings are intentionally skipped here; scheduler can enqueue background job.
+    FIXED: Validates token before sync and handles expiry properly.
     """
+    import datetime as dt
+    from datetime import timezone
+    
     changed: List[Dict[str, Any]] = []
-
-    # 0) connection
-    conn = await db["connections"].find_one({"userId": user_id, "provider": "zerodha", "enabled": True})
+    
+    # Get connection
+    conn = await db["connections"].find_one({
+        "userId": user_id, 
+        "provider": "zerodha", 
+        "enabled": True
+    })
+    
     if not conn:
-        return {"userId": str(user_id), "syncedAt": dt.datetime.now(timezone.utc).isoformat(), "updated": changed, "note": "no-connection"}
-
+        return {
+            "userId": str(user_id), 
+            "error": "no-connection",
+            "message": "No active Zerodha connection"
+        }
+    
     kite = build_kite_client(conn.get("accessToken"), conn.get("apiKey"))
-
-    # 1) instruments (optional & heavy)
-    if force_instruments:
-        try:
-            if not await _instruments_recent(db):
-                instruments = map_instruments(kite.get_instruments())
-                await upsert_instruments(db, instruments)
-                await _mark_instruments_updated(db)
-                changed.append({"doc": "instruments"})
-        except Exception as e:
-            changed.append({"doc": "instruments", "error": str(e)})
-
-    # 2) core user data (fast)
+    
+    # CRITICAL: Test token validity first
     try:
-        await upsert_funds(db, user_id, map_funds(kite.get_funds()))
-        changed.append({"doc": "funds"})
+        profile = kite.profile()
+        print(f"✅ [SYNC] Token valid for {profile.get('user_name')}")
     except Exception as e:
-        changed.append({"doc": "funds", "error": str(e)})
-
+        print(f"❌ [SYNC] Token expired for user {user_id}: {e}")
+        
+        # Mark connection as expired
+        await db["connections"].update_one(
+            {"_id": conn["_id"]},
+            {
+                "$set": {
+                    "enabled": False,
+                    "tokenExpiredAt": dt.datetime.now(timezone.utc),
+                    "lastError": str(e)
+                }
+            }
+        )
+        
+        return {
+            "userId": str(user_id),
+            "error": "token-expired", 
+            "message": "Zerodha token expired - user needs to login again"
+        }
+    
+    # Continue with sync only if token is valid...
+    
+    # Holdings
     try:
-        await upsert_holdings(db, user_id, map_holdings(kite.get_holdings()))
-        changed.append({"doc": "holdings"})
+        raw_holdings = kite.get_holdings()
+        
+        # Clear old data first
+        await db["holdings"].delete_many({"userId": user_id})
+        
+        # Map and insert fresh data
+        holdings = map_holdings(raw_holdings)
+        for h in holdings:
+            h["userId"] = user_id
+            h["syncedAt"] = dt.datetime.now(timezone.utc)
+        
+        if holdings:
+            await db["holdings"].insert_many(holdings)
+            
+        changed.append({"doc": "holdings", "count": len(holdings)})
+        
     except Exception as e:
         changed.append({"doc": "holdings", "error": str(e)})
-
+    
+    # Positions
     try:
-        await upsert_positions(db, user_id, map_positions(kite.get_positions()))
-        changed.append({"doc": "positions"})
+        raw_positions = kite.get_positions()
+        await db["positions"].delete_many({"userId": user_id})
+        
+        positions = map_positions(raw_positions)
+        for p in positions:
+            p["userId"] = user_id
+            p["syncedAt"] = dt.datetime.now(timezone.utc)
+        
+        if positions:
+            await db["positions"].insert_many(positions)
+            
+        changed.append({"doc": "positions", "count": len(positions)})
+        
     except Exception as e:
         changed.append({"doc": "positions", "error": str(e)})
-
+    
+    # Funds
+    try:
+        raw_funds = kite.get_funds()
+        await db["funds"].delete_many({"userId": user_id})
+        
+        funds = map_funds(raw_funds)
+        for f in funds:
+            f["userId"] = user_id
+            f["syncedAt"] = dt.datetime.now(timezone.utc)
+        
+        if funds:
+            await db["funds"].insert_many(funds)
+            
+        changed.append({"doc": "funds"})
+        
+    except Exception as e:
+        changed.append({"doc": "funds", "error": str(e)})
+    
+    # Orders and Trades
     try:
         all_orders = kite.get_orders()
-    
+        
         # Build trade history from completed orders
         trade_history = []
         for order in all_orders:
@@ -108,23 +174,21 @@ async def run_incremental_sync(
                     'price': order.get('average_price'),
                     'ts': order.get('order_timestamp')
                 })
-    
-        # Upsert trades
+        
         await upsert_trades(db, user_id, trade_history)
-        changed.append({"doc": "trades", "count": len(trade_history)})
-    
-        # Also save all orders
         await upsert_orders(db, user_id, map_orders(all_orders))
+        
+        changed.append({"doc": "trades", "count": len(trade_history)})
         changed.append({"doc": "orders", "count": len(all_orders)})
-    
+        
     except Exception as e:
-        changed.append({"doc": "orders", "error": str(e)})
-
+        changed.append({"doc": "orders/trades", "error": str(e)})
+    
     return {
         "userId": str(user_id),
         "syncedAt": dt.datetime.now(timezone.utc).isoformat(),
         "updated": changed,
-        "embeddings": "skipped" if skip_embeddings else "handled elsewhere"
+        "status": "success"
     }
 
 

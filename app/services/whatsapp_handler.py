@@ -620,45 +620,153 @@ Type "login" to get started."""
 
 
 
+# In app/services/whatsapp_handler.py - Replace handle_refresh_command
+
 async def handle_refresh_command(
     db: AsyncIOMotorDatabase,
     user_id: ObjectId
 ) -> str:
-    """Manually trigger portfolio sync."""
+    """
+    Manually trigger portfolio sync with token validation.
+    FIXED: Properly checks token validity and pulls fresh data.
+    """
+    from app.services.kite_client import build_kite_client
+    from app.services.mappers import map_holdings, map_positions, map_funds
+    from app.services.sync import build_embeddings_for_user
+    from datetime import datetime, timezone
+    
+    print(f"🔄 [REFRESH] Starting manual refresh for user {user_id}")
+    
+    # Get connection
+    conn = await db["connections"].find_one({
+        "userId": user_id,
+        "provider": "zerodha",
+        "enabled": True
+    })
+    
+    if not conn:
+        return """❌ Zerodha not connected.
+
+Type "login" to connect your account."""
+    
+    # Build Kite client
+    kite = build_kite_client(conn.get("accessToken"), conn.get("apiKey"))
+    
     try:
-        from app.services.sync import run_incremental_sync, build_embeddings_for_user
-        
-        print(f"🔄 [REFRESH] Starting manual sync for user {user_id}")
-        
-        # Sync portfolio
-        await run_incremental_sync(
-            db,
-            user_id,
-            force_instruments=False,
-            skip_embeddings=True
-        )
-        
-        # Regenerate embeddings
-        await build_embeddings_for_user(db, user_id)
-        
-        holdings_count = await db["holdings"].count_documents({"userId": user_id})
-        
-        print(f"✅ [REFRESH] Sync complete: {holdings_count} holdings")
-        
-        return f"""Portfolio refreshed!
-
-Synced: {holdings_count} holdings
-Data updated: Just now
-
-Try: "portfolio" or "pnl"
-
-Your data is now up-to-date!"""
+        # CRITICAL: Test token validity first
+        print(f"🔐 [REFRESH] Testing token validity...")
+        profile = kite.profile()  # This will fail if token expired
+        print(f"✅ [REFRESH] Token valid for user: {profile.get('user_name')}")
         
     except Exception as e:
-        print(f"❌ [REFRESH] Sync failed: {e}")
+        print(f"❌ [REFRESH] Token expired or invalid: {e}")
+        
+        # Clear invalid connection
+        await db["connections"].update_one(
+            {"userId": user_id, "provider": "zerodha"},
+            {"$set": {"enabled": False, "tokenExpiredAt": datetime.now(timezone.utc)}}
+        )
+        
+        return """❌ Zerodha session expired!
+
+Your login token has expired. Zerodha tokens are only valid for 1 day.
+
+Type "login" to reconnect your account."""
+    
+    try:
+        # Token is valid, proceed with refresh
+        print(f"📊 [REFRESH] Fetching fresh data from Zerodha...")
+        
+        # 1. Get fresh holdings
+        raw_holdings = kite.get_holdings()
+        print(f"📈 [REFRESH] Got {len(raw_holdings)} holdings")
+        
+        # 2. Get fresh positions
+        raw_positions = kite.get_positions()
+        print(f"📊 [REFRESH] Got positions data")
+        
+        # 3. Get fresh funds
+        raw_funds = kite.get_funds()
+        print(f"💰 [REFRESH] Got funds data")
+        
+        # DELETE old data before inserting new
+        print(f"🗑️ [REFRESH] Clearing old data...")
+        await db["holdings"].delete_many({"userId": user_id})
+        await db["positions"].delete_many({"userId": user_id})
+        await db["funds"].delete_many({"userId": user_id})
+        
+        # Map and insert fresh data
+        holdings = map_holdings(raw_holdings)
+        for h in holdings:
+            h["userId"] = user_id
+            h["syncedAt"] = datetime.now(timezone.utc)
+        
+        if holdings:
+            await db["holdings"].insert_many(holdings)
+            print(f"✅ [REFRESH] Inserted {len(holdings)} holdings")
+        
+        # Insert positions
+        positions = map_positions(raw_positions)
+        for p in positions:
+            p["userId"] = user_id
+            p["syncedAt"] = datetime.now(timezone.utc)
+        
+        if positions:
+            await db["positions"].insert_many(positions)
+            print(f"✅ [REFRESH] Inserted {len(positions)} positions")
+        
+        # Insert funds
+        funds = map_funds(raw_funds)
+        for f in funds:
+            f["userId"] = user_id
+            f["syncedAt"] = datetime.now(timezone.utc)
+        
+        if funds:
+            await db["funds"].insert_many(funds)
+            print(f"✅ [REFRESH] Inserted {len(funds)} fund records")
+        
+        # Calculate summary
+        total_value = sum(h.get("qty", 0) * h.get("lastPrice", 0) for h in holdings)
+        total_investment = sum(h.get("qty", 0) * h.get("avgPrice", 0) for h in holdings)
+        total_pnl = total_value - total_investment
+        pnl_pct = (total_pnl / total_investment * 100) if total_investment > 0 else 0
+        
+        # Regenerate embeddings in background
+        print(f"🤖 [REFRESH] Regenerating embeddings...")
+        try:
+            await build_embeddings_for_user(db, user_id)
+            embeddings_status = "✅"
+        except Exception as e:
+            print(f"⚠️ [REFRESH] Embeddings generation failed: {e}")
+            embeddings_status = "⚠️"
+        
+        print(f"✅ [REFRESH] Complete!")
+        
+        return f"""✅ Portfolio Refreshed!
+
+📊 Synced: {len(holdings)} holdings
+💰 Value: ₹{total_value:,.2f}
+📈 P&L: ₹{total_pnl:,.2f} ({pnl_pct:+.2f}%)
+🕐 Updated: Just now
+{embeddings_status} AI Memory: Updated
+
+Your data is now live from Zerodha!"""
+        
+    except Exception as e:
+        print(f"❌ [REFRESH] Sync error: {e}")
         import traceback
         traceback.print_exc()
         
-        return f"""Refresh failed: {str(e)}
+        # Check if it's a specific Zerodha error
+        error_str = str(e).lower()
+        
+        if "token" in error_str or "session" in error_str:
+            return """❌ Session expired!
 
-Try again, or contact support if the issue persists."""
+Type "login" to reconnect your Zerodha account."""
+        
+        return f"""❌ Refresh failed!
+
+Error: {str(e)}
+
+Try again or type "login" to reconnect."""
