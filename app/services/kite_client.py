@@ -100,3 +100,46 @@ def exchange_request_token_for_access_token(request_token: str) -> Dict[str, str
     # e.g. {'user_id': 'ABCD', 'access_token': '...', 'public_token': '...', ...}
     kite.set_access_token(data["access_token"])
     return {"access_token": data["access_token"], "public_token": data.get("public_token", "")}
+
+# Add this to app/services/kite_client.py
+
+async def validate_zerodha_token(db, user_id: ObjectId) -> tuple[bool, str]:
+    """
+    Validate if Zerodha token is still valid.
+    Returns: (is_valid, error_message)
+    """
+    from datetime import datetime, timezone
+    
+    conn = await db["connections"].find_one({
+        "userId": user_id,
+        "provider": "zerodha",
+        "enabled": True
+    })
+    
+    if not conn:
+        return False, "No Zerodha connection found"
+    
+    # Check if we marked it as expired
+    if conn.get("tokenExpiredAt"):
+        return False, "Token marked as expired"
+    
+    # Test the token
+    kite = build_kite_client(conn.get("accessToken"), conn.get("apiKey"))
+    
+    try:
+        profile = kite.profile()
+        return True, "Token valid"
+        
+    except Exception as e:
+        # Mark token as expired
+        await db["connections"].update_one(
+            {"_id": conn["_id"]},
+            {
+                "$set": {
+                    "enabled": False,
+                    "tokenExpiredAt": datetime.now(timezone.utc),
+                    "lastError": str(e)
+                }
+            }
+        )
+        return False, "Token expired - please login again"

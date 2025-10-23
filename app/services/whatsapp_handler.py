@@ -3,6 +3,7 @@
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from bson import ObjectId
 from typing import Dict, Any
+from datetime import datetime, timezone
 
 from app.services.user_management import get_or_create_user, update_user_preference
 from app.services.retrieval import retrieve_context
@@ -18,13 +19,15 @@ from app.settings import settings
 
 # app/services/whatsapp_handler.py - UPDATE
 
+# app/services/whatsapp_handler.py - UPDATE the MODES section
+
 async def handle_whatsapp_message(
     db: AsyncIOMotorDatabase,
     phone: str,
     message: str,
     profile_name: str = "User"
 ) -> str:
-    """Main handler - FIXED VERSION"""
+    """Main handler - UPDATED VERSION"""
     
     user = await get_or_create_user(db, phone)
     user_id = user["_id"]
@@ -73,20 +76,49 @@ async def handle_whatsapp_message(
         print(f"✅ [HANDLER] Matched HELP command")
         return get_help_message(user, conn is not None)
     
-    # MODES
-    if msg_lower in ["modes", "personas", "personalities", "styles"]:
-        print(f"✅ [HANDLER] Matched MODES command")
-        return get_personas_message()
+    # ============================================
+    # ✅ FIX: SHOW MODES LIST
+    # ============================================
+    
+    # Show modes list when user asks about modes
+    if msg_lower in ["modes", "mode", "personas", "personalities", "styles", "/modes", "/mode", "what modes", "show modes"]:
+        print(f"✅ [HANDLER] Matched MODES LIST command")
+        return get_personas_message(user)
     
     # STATUS
     if msg_lower in ["status", "connected", "account"]:
         print(f"✅ [HANDLER] Matched STATUS command")
         return await check_connection_status(db, user_id)
     
-    # SWITCH MODE
+    # ============================================
+    # MODE SWITCHING (must come AFTER mode list check)
+    # ============================================
+    
+    # Extract mode name (handles both formats)
+    mode_to_switch = None
+    
+    # Check direct mode names (savage, friendly, etc.)
     if msg_lower in ["savage", "friendly", "professional", "funny"]:
-        print(f"✅ [HANDLER] Matched MODE SWITCH command")
-        return await handle_mode_switch(db, phone, msg_lower)
+        mode_to_switch = msg_lower
+        print(f"✅ [HANDLER] Matched DIRECT mode switch: {mode_to_switch}")
+    
+    # Check /mode command format
+    elif msg_lower.startswith("/mode "):
+        mode_to_switch = msg_lower.replace("/mode ", "").strip()
+        print(f"✅ [HANDLER] Matched /mode command: {mode_to_switch}")
+    
+    # Check "mode X" format (but NOT just "mode" alone)
+    elif msg_lower.startswith("mode ") and len(msg_lower.split()) > 1:
+        mode_to_switch = msg_lower.replace("mode ", "").strip()
+        print(f"✅ [HANDLER] Matched 'mode X' command: {mode_to_switch}")
+    
+    # If we found a mode switch command, handle it
+    if mode_to_switch:
+        return await handle_mode_switch(db, phone, mode_to_switch)
+    
+    # ============================================
+    # Continue with other commands...
+    # ============================================
     
     # NEW SESSION
     if msg_lower in ["new session", "/new", "fresh start", "reset chat"]:
@@ -94,14 +126,12 @@ async def handle_whatsapp_message(
         result = await start_new_session(db, user_id)
         return result["message"]
     
-    # REFRESH (manual sync
+    # REFRESH
     if msg_lower in ["refresh", "sync", "update"]:
         print(f"🔄 [HANDLER] Matched REFRESH command")
         if not conn:
             return "You haven't connected your Zerodha account yet!\n\nType \"login\" to get started."
         return await handle_refresh_command(db, user_id)
-    
-          
     
     # ============================================
     # PRIORITY 2: REGULAR QUESTIONS
@@ -109,9 +139,8 @@ async def handle_whatsapp_message(
     
     # Check if user needs to connect first
     if not conn:
-        portfolio_keywords = ['portfolio', 'holdings', 'stocks', 'pnl', 'profit', 'loss', 'tatacap', 'tcs', 'reliance']
+        portfolio_keywords = ['portfolio', 'holdings', 'stocks', 'pnl', 'profit', 'loss']
         if any(keyword in msg_lower for keyword in portfolio_keywords):
-            # Check if first time user (no messages yet)
             message_count = await db["messages"].count_documents({"userId": user_id})
             if message_count == 0:
                 print(f"👋 [HANDLER] First message from unconnected user - showing welcome")
@@ -119,10 +148,9 @@ async def handle_whatsapp_message(
             else:
                 return "Please connect your Zerodha account first.\n\nType \"login\" to get started."
     
-    # Process as regular question (this will save the message!)
+    # Process as regular question
     print(f"💬 [HANDLER] Processing as regular question")
     return await handle_question(db, user_id, phone, message)
-
 
 # ============================================
 # WELCOME & INFO MESSAGES
@@ -165,33 +193,47 @@ Once connected, just ask me anything:
 Ready to connect? Type: login"""
 
 
-def get_personas_message() -> str:
-    """Explain the 4 personality modes."""
-    return """Choose Your TradeBuddy Personality:
+# app/services/whatsapp_handler.py - REPLACE get_personas_message
 
-1. FRIENDLY (Default)
-Casual, warm, and conversational
-Perfect for everyday questions
+def get_personas_message(user: dict) -> str:
+    """
+    Explain the 4 personality modes.
+    Shows current mode with indicator.
+    """
+    current_mode = user.get("preferences", {}).get("personalityMode", "friendly")
+    
+    # Add indicator to current mode
+    modes_info = {
+        "friendly": "😊 FRIENDLY (Default)\nCasual, warm, and conversational\nPerfect for everyday questions",
+        "professional": "💼 PROFESSIONAL\nFormal, analytical, data-driven\nBest for serious analysis",
+        "savage": "🔥 SAVAGE\nBrutally honest, no sugarcoating\nFor traders who want the hard truth",
+        "funny": "😂 FUNNY\nMemes, jokes, casual vibes\nMake investing fun"
+    }
+    
+    # Build message with current mode highlighted
+    message_parts = ["TradeBuddy Personality Modes\n"]
+    
+    for mode_key, mode_desc in modes_info.items():
+        if mode_key == current_mode:
+            message_parts.append(f"✅ {mode_desc} (ACTIVE)\n")
+        else:
+            message_parts.append(f"{mode_desc}\n")
+    
+    message_parts.append(f"""
+Current Mode: {current_mode.title()}
 
-2. PROFESSIONAL
-Formal, analytical, data-driven
-Best for serious analysis
+TO SWITCH:
+Type: /mode [name]
 
-3. SAVAGE
-Brutally honest, no sugarcoating
-For traders who want the hard truth
+Examples:
+- /mode savage
+- /mode friendly
+- savage
+- friendly
 
-4. FUNNY
-Memes, jokes, casual vibes
-Make investing fun
-
-TO SWITCH MODES:
-Type: friendly
-Type: professional
-Type: savage
-Type: funny
-
-Current questions? Just ask away!"""
+Try asking a question to see the difference!""")
+    
+    return "\n".join(message_parts)
 
 
 def get_help_message(user: dict, has_connection: bool) -> str:
@@ -542,19 +584,21 @@ Available commands:
 Or just ask me anything!"""
 
 
+# app/services/whatsapp_handler.py - REPLACE handle_mode_switch
+
 async def handle_mode_switch(
     db: AsyncIOMotorDatabase,
     phone: str,
     message: str
 ) -> str:
-    """Handle personality mode switching."""
-    mode = message.strip()
+    """Handle personality mode switching - FIXED VERSION."""
+    mode = message.strip().lower()
     
     valid_modes = {
-        "savage": "Savage mode activated. Prepare for brutal honesty.",
-        "friendly": "Friendly mode activated! Let's chat casually.",
-        "professional": "Professional mode activated. Formal analysis engaged.",
-        "funny": "Funny mode activated! Time for memes!"
+        "savage": "🔥 Savage mode activated. Prepare for brutal honesty.",
+        "friendly": "😊 Friendly mode activated! Let's chat casually.",
+        "professional": "💼 Professional mode activated. Formal analysis engaged.",
+        "funny": "😂 Funny mode activated! Time for memes!"
     }
     
     if mode not in valid_modes:
@@ -566,9 +610,35 @@ async def handle_mode_switch(
 
 Type the mode name to switch."""
     
-    success = await update_user_preference(db, phone, "personalityMode", mode)
+    # ✅ FIX: Ensure user exists first
+    user = await get_or_create_user(db, phone)
     
-    return valid_modes[mode] if success else "Failed to switch mode. Try again."
+    # ✅ FIX: Update with proper error handling
+    try:
+        result = await db["users"].update_one(
+            {"phone": phone},
+            {
+                "$set": {
+                    "preferences.personalityMode": mode,
+                    "updatedAt": datetime.now(timezone.utc)
+                },
+                "$push": {
+                    "modeHistory": {
+                        "mode": mode,
+                        "setAt": datetime.now(timezone.utc)
+                    }
+                }
+            }
+        )
+        
+        if result.modified_count > 0 or result.matched_count > 0:
+            return valid_modes[mode]
+        else:
+            return f"⚠️ Mode switch failed. Please try again or type 'help'."
+            
+    except Exception as e:
+        print(f"❌ Mode switch error: {e}")
+        return f"❌ Error switching mode: {str(e)}"
 
 
 # ============================================
