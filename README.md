@@ -893,7 +893,6 @@ Contributions are welcome! Please follow these guidelines:
 - 🚧 Alert system for price targets
 
 ---
-
 ## ⭐ Star History
 
 If you find this project useful, please consider giving it a star!  
@@ -904,18 +903,5 @@ If you find this project useful, please consider giving it a star!
 <div align="center">
 
 **Built with ❤️ for Indian retail traders**
-
-</div>
-## ⭐ Star History
-
-If you find this project useful, please consider giving it a star!
-
-https://github.com/manikanta-alapati/TradeBuddy
----
-
-<div align="center">
-
-**Built with ❤️ for Indian retail traders**
-
 
 </div>
