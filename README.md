@@ -896,6 +896,18 @@ Contributions are welcome! Please follow these guidelines:
 
 ## ⭐ Star History
 
+If you find this project useful, please consider giving it a star!  
+[![GitHub stars](https://img.shields.io/github/stars/manikanta-alapati/TradeBuddy?style=social)](https://github.com/manikanta-alapati/TradeBuddy)
+
+---
+
+<div align="center">
+
+**Built with ❤️ for Indian retail traders**
+
+</div>
+## ⭐ Star History
+
 If you find this project useful, please consider giving it a star!
 
 https://github.com/manikanta-alapati/TradeBuddy
